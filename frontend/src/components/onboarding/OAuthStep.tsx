@@ -242,7 +242,7 @@ export function OAuthStep({ onNext, onBack, onSkip }: OAuthStepProps) {
                 // Reload profiles
                 await loadClaudeProfiles();
 
-                alert(`✅ Authentication successful!\n\n${status.email ? `Account: ${status.email}` : 'You can now use this profile.'}`);
+                // Success handled by UI state update
               } else if (status.status === 'error') {
                 clearInterval(pollInterval);
                 setAuthenticatingProfileId(null);
@@ -344,7 +344,7 @@ export function OAuthStep({ onNext, onBack, onSkip }: OAuthStepProps) {
       await loadClaudeProfiles();
       setShowAuthTerminal(false);
       setTerminalProfileId(null);
-      alert(`✅ Authentication successful!\n\n${email ? `Account: ${email}` : 'Your Claude.ai subscription is now connected.'}`);
+      // Success - UI will show authenticated state
     } else {
       alert(`Failed to save token: ${result.error || 'Please try again.'}`);
     }

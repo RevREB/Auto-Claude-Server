@@ -88,15 +88,18 @@ class WebSocketManager:
 
     async def broadcast_event(self, event_type: str, data: Any):
         """Broadcast an event to all subscribed connections."""
-        print(f"[WS] broadcast_event: {event_type}, subs: {list(self.subscriptions.keys())}")
-        if event_type not in self.subscriptions:
-            print(f"[WS] No subscribers for {event_type}")
+        # Collect all subscribers: exact match + wildcard '*' subscribers
+        all_subscribers = set()
+        if event_type in self.subscriptions:
+            all_subscribers.update(self.subscriptions[event_type])
+        if '*' in self.subscriptions:
+            all_subscribers.update(self.subscriptions['*'])
+
+        if not all_subscribers:
             return
 
-        subscriber_count = len(self.subscriptions[event_type])
-        print(f"[WS] Broadcasting to {subscriber_count} subscribers")
         dead_connections = []
-        for conn_id in self.subscriptions[event_type]:
+        for conn_id in all_subscribers:
             if conn_id in self.connections:
                 try:
                     event_msg = {
@@ -105,12 +108,9 @@ class WebSocketManager:
                         "data": serialize_for_json(data)
                     }
                     await self.connections[conn_id].send_text(json.dumps(event_msg, default=str))
-                    print(f"[WS] Sent event to {conn_id}")
                 except Exception as e:
-                    print(f"[WS] Error sending to {conn_id}: {e}")
                     dead_connections.append(conn_id)
             else:
-                print(f"[WS] Connection {conn_id} not found in connections dict")
                 dead_connections.append(conn_id)
 
         # Clean up dead connections
