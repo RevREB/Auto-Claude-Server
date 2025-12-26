@@ -1,30 +1,24 @@
-# Production Docker Compose
-# Usage: docker-compose -f docker-compose.prod.yml up -d
+# Production docker-compose - uses pre-built images from GitHub Container Registry
+# Usage:
+#   VERSION=0.0.1 docker-compose -f docker-compose.prod.yml up -d
+#   docker-compose -f docker-compose.prod.yml up -d  # uses 'latest'
 
 services:
-  # Backend API + Python agents
   backend:
-    build: ./backend
+    image: ghcr.io/revreb/auto-claude-server/backend:${VERSION:-latest}
     container_name: auto-claude-backend
-    # No external ports - only accessible through nginx
-    expose:
-      - "8000"
+    ports:
+      - "8000:8000"
     volumes:
-      # Production: no code mounts, only data volumes
       - projects-data:/projects
       - claude-data:/root/.claude
       - github-data:/root/.config/gh
       - auto-claude-data:/app/.auto-claude
     environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - AUTO_BUILD_MODEL=${AUTO_BUILD_MODEL:-claude-sonnet-4-20250514}
+      - AUTO_BUILD_MODEL=${AUTO_BUILD_MODEL:-claude-opus-4-5-20251101}
       - PYTHONUNBUFFERED=1
-      # OAuth settings for TSIDP
-      - OAUTH_ISSUER_URL=${OAUTH_ISSUER_URL}
-      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
-      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
-      - OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI:-https://localhost/api/auth/callback}
-      - SESSION_SECRET=${SESSION_SECRET}
     networks:
       - auto-claude-net
     restart: unless-stopped
@@ -34,41 +28,30 @@ services:
       timeout: 10s
       retries: 3
 
-  # Frontend (React SPA served by nginx with SSL)
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile.prod
+    image: ghcr.io/revreb/auto-claude-server/frontend:${VERSION:-latest}
     container_name: auto-claude-frontend
     ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      # SSL certificates
-      - ./certs:/etc/nginx/ssl:ro
+      - "3000:80"
     depends_on:
       - backend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000
     networks:
       - auto-claude-net
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
 
-  # Code Server (VS Code in browser) - optional in production
   code-server:
     image: codercom/code-server:latest
     container_name: auto-claude-code-server
-    # No external ports - access through Tailscale or internal only
-    expose:
-      - "8080"
+    ports:
+      - "8080:8080"
     volumes:
       - projects-data:/projects
       - code-server-data:/home/coder/.local/share/code-server
     environment:
-      - PASSWORD=${CODE_SERVER_PASSWORD:-changeme}
+      - PASSWORD=${CODE_SERVER_PASSWORD:-claude123}
       - CS_DISABLE_GETTING_STARTED_OVERRIDE=1
     user: "0:0"
     working_dir: /projects
@@ -76,13 +59,11 @@ services:
       - auto-claude-net
     restart: unless-stopped
 
-  # Redis for task queuing and session management
   redis:
     image: redis:7-alpine
     container_name: auto-claude-redis
-    # No external ports - internal only
-    expose:
-      - "6379"
+    ports:
+      - "6379:6379"
     volumes:
       - redis-data:/data
     networks:
@@ -92,17 +73,11 @@ services:
 
 volumes:
   projects-data:
-    driver: local
   auto-claude-data:
-    driver: local
   redis-data:
-    driver: local
   claude-data:
-    driver: local
   github-data:
-    driver: local
   code-server-data:
-    driver: local
 
 networks:
   auto-claude-net:
