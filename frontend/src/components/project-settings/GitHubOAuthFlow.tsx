@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent } from '../ui/card';
+import { GitHubAuthTerminal } from '../GitHubAuthTerminal';
 
 interface GitHubOAuthFlowProps {
   onSuccess: (token: string, username?: string) => void;
@@ -41,11 +42,12 @@ const AUTH_TIMEOUT_MS = 5 * 60 * 1000;
  * Guides users through authenticating with GitHub using the gh CLI
  */
 export function GitHubOAuthFlow({ onSuccess, onCancel }: GitHubOAuthFlowProps) {
-  const [status, setStatus] = useState<'checking' | 'need-install' | 'need-auth' | 'authenticating' | 'success' | 'error'>('checking');
+  const [status, setStatus] = useState<'checking' | 'need-install' | 'need-auth' | 'authenticating' | 'terminal' | 'success' | 'error'>('checking');
   const [error, setError] = useState<string | null>(null);
   const [_cliInstalled, setCliInstalled] = useState(false);
   const [cliVersion, setCliVersion] = useState<string | undefined>();
   const [username, setUsername] = useState<string | undefined>();
+  const [showTerminal, setShowTerminal] = useState(false);
 
   // Device flow state for displaying code and auth URL
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
@@ -191,6 +193,27 @@ export function GitHubOAuthFlow({ onSuccess, onCancel }: GitHubOAuthFlowProps) {
 
   const handleStartAuth = async () => {
     debugLog('handleStartAuth() called');
+    // Show terminal for interactive auth
+    setShowTerminal(true);
+    setStatus('terminal');
+    setError(null);
+  };
+
+  const handleTerminalSuccess = async () => {
+    debugLog('Terminal auth success, fetching token...');
+    setShowTerminal(false);
+    await fetchAndNotifyToken();
+  };
+
+  const handleTerminalClose = () => {
+    debugLog('Terminal closed');
+    setShowTerminal(false);
+    // Check if auth completed while terminal was open
+    checkGitHubStatus();
+  };
+
+  const handleStartAuthLegacy = async () => {
+    debugLog('handleStartAuthLegacy() called');
     setStatus('authenticating');
     setError(null);
 
@@ -230,9 +253,58 @@ export function GitHubOAuthFlow({ onSuccess, onCancel }: GitHubOAuthFlowProps) {
       }
 
       if (result.success && result.data?.success) {
-        debugLog('Auth successful, fetching token...');
+        debugLog('Auth successful (already authenticated or completed), fetching token...');
         // Fetch the token and notify parent
         await fetchAndNotifyToken();
+      } else if (result.data?.deviceCode) {
+        // Device code flow - stay in authenticating state
+        // Backend will broadcast github.authComplete when done
+        debugLog('Device code flow started, waiting for backend event...');
+
+        // Re-enable timeout for waiting phase
+        authTimeoutRef.current = setTimeout(handleAuthTimeout, AUTH_TIMEOUT_MS);
+
+        // Listen for auth complete event from backend
+        const unsubscribe = window.api.onEvent((event) => {
+          if (event.type === 'github.authComplete') {
+            debugLog('Received github.authComplete event:', event.data);
+            clearAuthTimeout();
+            unsubscribe();
+
+            if (event.data?.success) {
+              fetchAndNotifyToken();
+            } else {
+              setError(event.data?.error || 'Authentication failed');
+              setStatus('error');
+            }
+          }
+        });
+
+        // Also poll as fallback (in case event is missed)
+        const pollInterval = setInterval(async () => {
+          try {
+            const authCheck = await window.api.checkGitHubAuth();
+            debugLog('Auth poll result:', authCheck);
+
+            if (authCheck.success && authCheck.data?.authenticated) {
+              clearInterval(pollInterval);
+              clearAuthTimeout();
+              unsubscribe();
+              debugLog('Auth completed via polling, fetching token...');
+              await fetchAndNotifyToken();
+            }
+          } catch (pollErr) {
+            debugLog('Polling error:', pollErr);
+          }
+        }, 3000); // Poll every 3 seconds as fallback
+
+        // Clean up on timeout
+        authTimeoutRef.current = setTimeout(() => {
+          clearInterval(pollInterval);
+          unsubscribe();
+          handleAuthTimeout();
+        }, AUTH_TIMEOUT_MS);
+
       } else {
         debugLog('Auth failed:', result.error);
         // Include fallback URL info in error message if available
@@ -288,6 +360,18 @@ export function GitHubOAuthFlow({ onSuccess, onCancel }: GitHubOAuthFlowProps) {
   };
 
   debugLog('Rendering with status:', status);
+
+  // Show terminal for interactive auth
+  if (showTerminal) {
+    return (
+      <div className="h-[400px] border border-border rounded-lg overflow-hidden">
+        <GitHubAuthTerminal
+          onClose={handleTerminalClose}
+          onSuccess={handleTerminalSuccess}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">

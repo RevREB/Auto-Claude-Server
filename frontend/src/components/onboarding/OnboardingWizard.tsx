@@ -12,6 +12,7 @@ import { ScrollArea } from '../ui/scroll-area';
 import { WizardProgress, WizardStep } from './WizardProgress';
 import { WelcomeStep } from './WelcomeStep';
 import { OAuthStep } from './OAuthStep';
+import { GitHubStep } from './GitHubStep';
 import { MemoryStep } from './MemoryStep';
 import { CompletionStep } from './CompletionStep';
 import { useSettingsStore } from '../../stores/settings-store';
@@ -24,12 +25,13 @@ interface OnboardingWizardProps {
 }
 
 // Wizard step identifiers
-type WizardStepId = 'welcome' | 'oauth' | 'memory' | 'completion';
+type WizardStepId = 'welcome' | 'oauth' | 'github' | 'memory' | 'completion';
 
 // Step configuration
 const WIZARD_STEPS: { id: WizardStepId; label: string }[] = [
   { id: 'welcome', label: 'Welcome' },
-  { id: 'oauth', label: 'Auth' },
+  { id: 'oauth', label: 'Claude' },
+  { id: 'github', label: 'GitHub' },
   { id: 'memory', label: 'Memory' },
   { id: 'completion', label: 'Done' }
 ];
@@ -148,6 +150,14 @@ export function OnboardingWizard({
       case 'oauth':
         return (
           <OAuthStep
+            onNext={goToNextStep}
+            onBack={goToPreviousStep}
+            onSkip={skipWizard}
+          />
+        );
+      case 'github':
+        return (
+          <GitHubStep
             onNext={goToNextStep}
             onBack={goToPreviousStep}
             onSkip={skipWizard}

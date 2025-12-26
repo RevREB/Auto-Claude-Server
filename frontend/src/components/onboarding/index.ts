@@ -6,6 +6,7 @@
 export { OnboardingWizard } from './OnboardingWizard';
 export { WelcomeStep } from './WelcomeStep';
 export { OAuthStep } from './OAuthStep';
+export { GitHubStep } from './GitHubStep';
 export { MemoryStep } from './MemoryStep';
 export { OllamaModelSelector } from './OllamaModelSelector';
 export { FirstSpecStep } from './FirstSpecStep';

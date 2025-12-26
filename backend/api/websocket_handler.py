@@ -13,6 +13,7 @@ from typing import Dict, Any, Callable, Optional
 import json
 import asyncio
 import traceback
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from pydantic import BaseModel
@@ -847,47 +848,154 @@ def register_handlers(app_state: dict):
             print(f"[WS] Error checking gh auth: {e}")
             return {"authenticated": False, "error": str(e)}
 
+    # Store background auth processes
+    _gh_auth_processes: dict = {}
+
     async def github_start_auth(conn_id: str, payload: dict) -> dict:
-        """Start GitHub OAuth flow using gh CLI."""
+        """Start GitHub OAuth flow using gh CLI device flow."""
+        import re
+        import os
+        import pty
+        import select as sel
+
         try:
-            # Run gh auth login with device flow
-            result = subprocess.run(
-                ["gh", "auth", "login", "--web", "--git-protocol", "https"],
+            # First check if already authenticated
+            auth_check = subprocess.run(
+                ["gh", "auth", "status"],
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minutes for user to complete auth
+                timeout=10
             )
-            if result.returncode == 0:
-                return {"success": True}
+            if auth_check.returncode == 0:
+                print("[WS] GitHub already authenticated")
+                return {"success": True, "message": "Already authenticated"}
 
-            # Parse error and look for device code / URL
-            output = result.stdout + result.stderr
+            # Use PTY to capture interactive output from gh auth login
+            # gh CLI needs a TTY to output the device code
+            master_fd, slave_fd = pty.openpty()
+
+            process = subprocess.Popen(
+                ["gh", "auth", "login", "--git-protocol", "https"],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=False,  # Binary mode for PTY
+                env={**os.environ, "TERM": "dumb"}
+            )
+
+            os.close(slave_fd)  # Close slave in parent
+
+            # Store process for later cleanup
+            _gh_auth_processes[conn_id] = {"process": process, "master_fd": master_fd}
+
+            # Read output from PTY
             device_code = None
-            auth_url = None
+            auth_url = "https://github.com/login/device"
+            output = b""
 
-            # Try to extract device code and URL from output
-            import re
-            code_match = re.search(r'code:\s*([A-Z0-9-]+)', output, re.IGNORECASE)
-            url_match = re.search(r'https://github\.com/login/device', output)
+            # Read with timeout - device code should appear within a few seconds
+            start_time = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - start_time < 5:
+                # Check if there's data to read
+                readable, _, _ = sel.select([master_fd], [], [], 0.5)
+                if readable:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                        if chunk:
+                            output += chunk
+                            print(f"[WS] gh output chunk: {chunk[:200]}")
 
-            if code_match:
-                device_code = code_match.group(1)
-            if url_match:
-                auth_url = "https://github.com/login/device"
+                            # Check if we have the device code
+                            output_str = output.decode('utf-8', errors='ignore')
+                            code_match = re.search(r'\b([A-Z0-9]{4}-[A-Z0-9]{4})\b', output_str)
+                            if code_match:
+                                device_code = code_match.group(1)
+                                print(f"[WS] Found device code: {device_code}")
+                                break
+                    except OSError:
+                        break
+                await asyncio.sleep(0.1)
 
-            return {
-                "success": False,
-                "error": result.stderr or "Authentication failed",
-                "deviceCode": device_code,
-                "authUrl": auth_url
-            }
+            output_str = output.decode('utf-8', errors='ignore')
+            print(f"[WS] gh auth full output: {output_str[:500]}")
+
+            if device_code:
+                # Start background task to monitor for completion
+                asyncio.create_task(_monitor_gh_auth(conn_id, process, master_fd))
+
+                return {
+                    "success": False,  # Not yet complete, user needs to enter code
+                    "deviceCode": device_code,
+                    "authUrl": auth_url,
+                    "browserOpened": False,
+                    "message": "Enter the code at GitHub to authenticate"
+                }
+            else:
+                # Kill the process if we couldn't get a device code
+                process.terminate()
+                os.close(master_fd)
+                return {
+                    "success": False,
+                    "error": "Could not get device code from gh CLI. Try refreshing and authenticating again.",
+                    "authUrl": auth_url,
+                    "fallbackUrl": auth_url
+                }
+
         except FileNotFoundError:
             return {"success": False, "error": "gh CLI not installed"}
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Authentication timed out"}
         except Exception as e:
             print(f"[WS] Error starting gh auth: {e}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
+
+    async def _monitor_gh_auth(conn_id: str, process, master_fd: int):
+        """Monitor gh auth process and broadcast when complete."""
+        import os
+        import select as sel
+
+        try:
+            # Wait for process to complete (user entering code at GitHub)
+            while process.poll() is None:
+                # Drain any remaining output
+                readable, _, _ = sel.select([master_fd], [], [], 1.0)
+                if readable:
+                    try:
+                        os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                await asyncio.sleep(1)
+
+            os.close(master_fd)
+
+            # Check if auth succeeded
+            result = subprocess.run(
+                ["gh", "auth", "status"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                print(f"[WS] GitHub auth completed for {conn_id}")
+                # Broadcast success event
+                await ws_manager.broadcast_event("github.authComplete", {
+                    "success": True,
+                    "message": "GitHub authentication completed"
+                })
+            else:
+                print(f"[WS] GitHub auth failed for {conn_id}")
+                await ws_manager.broadcast_event("github.authComplete", {
+                    "success": False,
+                    "error": "Authentication was not completed"
+                })
+
+        except Exception as e:
+            print(f"[WS] Error monitoring gh auth: {e}")
+
+        # Cleanup
+        if conn_id in _gh_auth_processes:
+            del _gh_auth_processes[conn_id]
 
     async def github_get_token(conn_id: str, payload: dict) -> dict:
         """Get GitHub token from gh CLI."""
