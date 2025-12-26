@@ -182,6 +182,8 @@ async def terminal_websocket(websocket: WebSocket, session_id: str):
         from pathlib import Path
 
         auth_completed = False
+        gh_auth_completed = False
+        is_gh_auth = auto_run and 'gh auth' in auto_run
 
         try:
             async for data in pty_session.read():
@@ -256,6 +258,25 @@ async def terminal_websocket(websocket: WebSocket, session_id: str):
                                     break
                             except Exception as e:
                                 print(f"DEBUG: Failed to read credentials from {creds_path}: {e}")
+
+                # Check for GitHub CLI auth completion
+                if is_gh_auth and not gh_auth_completed:
+                    gh_success_phrases = [
+                        "logged in as",
+                        "authentication complete",
+                        "configured git protocol"
+                    ]
+                    if any(phrase in data.lower() for phrase in gh_success_phrases):
+                        print(f"DEBUG: Detected GitHub auth success in output")
+                        gh_auth_completed = True
+                        try:
+                            await websocket.send_json({
+                                "type": "gh_auth_completed",
+                                "success": True
+                            })
+                            print(f"DEBUG: Sent gh_auth_completed message via WebSocket")
+                        except Exception as e:
+                            print(f"ERROR: Failed to send gh_auth_completed: {e}")
 
         except Exception as e:
             print(f"Error reading from PTY: {e}")

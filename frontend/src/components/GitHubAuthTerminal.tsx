@@ -89,17 +89,23 @@ export function GitHubAuthTerminal({ onClose, onSuccess }: GitHubAuthTerminalPro
             const data = JSON.parse(event.data);
             if (data.type === 'output') {
               term.write(data.data);
-
-              // Check for success message - look for various success indicators
-              if (data.data.includes('Logged in as') ||
-                  data.data.includes('Authentication complete') ||
-                  data.data.includes('Configured git protocol')) {
-                setAuthCompleted(true);
-              }
+            } else if (data.type === 'gh_auth_completed') {
+              // Backend detected GitHub auth success
+              console.log('[GitHubAuth] Backend confirmed auth success');
+              term.writeln('');
+              term.writeln('\x1b[32m✓ GitHub authentication completed!\x1b[0m');
+              term.writeln('\x1b[90mClosing in 2 seconds...\x1b[0m');
+              setAuthCompleted(true);
+              // Auto-close after delay so user sees success message
+              setTimeout(() => {
+                if (onSuccess) onSuccess();
+                onClose();
+              }, 2000);
             } else if (data.type === 'exit') {
               term.writeln('');
+              console.log('[GitHubAuth] Process exited with code:', data.code);
               if (data.code === 0) {
-                term.writeln('\x1b[32m✓ GitHub authentication completed!\x1b[0m');
+                // Process exited cleanly - auth likely succeeded
                 setAuthCompleted(true);
               } else {
                 term.writeln(`\x1b[31mProcess exited with code ${data.code}\x1b[0m`);
