@@ -1,0 +1,43 @@
+# Internal ACME CA using step-ca
+# This gives you a private Certificate Authority that supports ACME protocol
+#
+# Setup:
+#   1. docker-compose -f docker-compose.step-ca.yml up -d step-ca
+#   2. Get root CA cert: docker exec step-ca step ca root > root-ca.crt
+#   3. Install root-ca.crt in your browser/OS trust store
+#   4. Configure nginx/caddy to use ACME with https://step-ca:9000/acme/acme/directory
+
+services:
+  step-ca:
+    image: smallstep/step-ca:latest
+    container_name: step-ca
+    ports:
+      - "9000:9000"  # ACME endpoint
+    volumes:
+      - step-ca-data:/home/step
+    environment:
+      - DOCKER_STEPCA_INIT_NAME=Auto-Claude CA
+      - DOCKER_STEPCA_INIT_DNS_NAMES=step-ca,localhost
+      - DOCKER_STEPCA_INIT_REMOTE_MANAGEMENT=true
+      - DOCKER_STEPCA_INIT_ACME=true
+    networks:
+      - auto-claude-net
+    restart: unless-stopped
+
+volumes:
+  step-ca-data:
+
+networks:
+  auto-claude-net:
+    external: true
+    name: auto-claude-docker_auto-claude-net
+
+# Usage with Caddy:
+# {
+#     acme_ca https://step-ca:9000/acme/acme/directory
+#     acme_ca_root /path/to/root-ca.crt
+# }
+#
+# Usage with certbot:
+# certbot certonly --server https://step-ca:9000/acme/acme/directory \
+#   --standalone -d your-internal-hostname

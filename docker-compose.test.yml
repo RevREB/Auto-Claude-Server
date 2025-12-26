@@ -1,0 +1,113 @@
+services:
+  # Backend service for testing
+  backend-test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - AUTO_BUILD_MODEL=${AUTO_BUILD_MODEL:-claude-opus-4-5-20251101}
+      - REDIS_URL=redis://redis-test:6379
+      - TESTING=true
+    volumes:
+      - ./backend:/app
+      - test-projects-data:/app/projects
+      - test-claude-data:/root/.claude
+      - test-github-data:/root/.config/gh
+      - test-auto-claude-data:/app/.auto-claude
+    ports:
+      - "8001:8000"
+    depends_on:
+      - redis-test
+    networks:
+      - test-network
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend service for testing
+  frontend-test:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      - VITE_API_URL=http://backend-test:8000
+      - NODE_ENV=test
+    volumes:
+      - ./frontend/nginx.test.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend-test
+    networks:
+      - test-network
+
+  # Redis for testing (isolated from production)
+  redis-test:
+    image: redis:7-alpine
+    volumes:
+      - test-redis-data:/data
+    networks:
+      - test-network
+    command: redis-server --appendonly yes
+
+  # Playwright test runner
+  playwright-tests:
+    image: mcr.microsoft.com/playwright:v1.57.0-jammy
+    working_dir: /tests
+    volumes:
+      - ./tests/e2e:/tests
+      - ./tests/e2e/test-results:/tests/test-results
+    environment:
+      - BASE_URL=http://frontend-test:80
+      - API_URL=http://backend-test:8000
+      - BACKEND_URL=http://backend-test:8000
+      - CI=true
+      - DOCKER_TEST=true
+    networks:
+      - test-network
+    depends_on:
+      - frontend-test
+      - backend-test
+    command: >
+      sh -c "npm install && npx playwright test --project=chromium"
+    profiles:
+      - e2e
+
+  # Backend pytest runner
+  backend-tests:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    working_dir: /app/tests
+    volumes:
+      - ./tests/backend:/app/tests
+      - ./backend:/app/backend
+      - test-projects-data:/app/projects
+    environment:
+      - API_URL=http://backend-test:8000
+      - TESTING=true
+      - PYTHONPATH=/app/backend
+    networks:
+      - test-network
+    depends_on:
+      - backend-test
+      - redis-test
+    command: >
+      sh -c "pip install -r /app/tests/requirements.txt && pytest -v"
+    profiles:
+      - backend
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes:
+  test-projects-data:
+    driver: local
+  test-claude-data:
+    driver: local
+  test-github-data:
+    driver: local
+  test-auto-claude-data:
+    driver: local
+  test-redis-data:
+    driver: local

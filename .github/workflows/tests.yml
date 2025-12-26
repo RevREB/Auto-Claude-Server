@@ -1,0 +1,227 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  backend-tests:
+    name: Backend API Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: tests/backend
+        run: |
+          pip install -r requirements.txt
+
+      - name: Start test services
+        run: |
+          docker-compose -f docker-compose.test.yml up -d backend-test redis-test
+          sleep 10
+
+      - name: Wait for backend
+        run: |
+          timeout 60 bash -c 'until curl -f http://localhost:8001/health; do sleep 2; done'
+
+      - name: Run pytest
+        run: |
+          docker-compose -f docker-compose.test.yml run --rm backend-tests
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: tests/backend/test-results/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker-compose -f docker-compose.test.yml down -v
+
+  e2e-tests:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: tests/e2e/package-lock.json
+
+      - name: Install Playwright dependencies
+        working-directory: tests/e2e
+        run: |
+          npm ci
+
+      - name: Start test services
+        run: |
+          docker-compose -f docker-compose.test.yml up -d backend-test redis-test frontend-test
+          sleep 15
+
+      - name: Wait for services
+        run: |
+          timeout 60 bash -c 'until curl -f http://localhost:8001/health; do sleep 2; done'
+          timeout 60 bash -c 'until curl -f http://localhost:3001; do sleep 2; done'
+
+      - name: Run Playwright tests
+        run: |
+          docker-compose -f docker-compose.test.yml run --rm playwright-tests
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: tests/e2e/test-results/
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e/playwright-report/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker-compose -f docker-compose.test.yml down -v
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python linting tools
+        run: |
+          pip install black flake8 mypy
+
+      - name: Run Black (Python formatter check)
+        working-directory: backend
+        run: |
+          black --check .
+
+      - name: Run Flake8 (Python linter)
+        working-directory: backend
+        run: |
+          flake8 . --max-line-length=120 --exclude=venv,__pycache__
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run ESLint (JavaScript/TypeScript linter)
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Run TypeScript type check
+        working-directory: frontend
+        run: npm run typecheck
+
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: false
+          tags: auto-claude-backend:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: false
+          tags: auto-claude-frontend:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [backend-tests, e2e-tests, security-scan, lint, build]
+    if: always()
+
+    steps:
+      - name: Check test results
+        run: |
+          if [[ "${{ needs.backend-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.e2e-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.lint.result }}" == "success" ]] && \
+             [[ "${{ needs.build.result }}" == "success" ]]; then
+            echo "✅ All tests passed!"
+            exit 0
+          else
+            echo "❌ Some tests failed"
+            echo "Backend: ${{ needs.backend-tests.result }}"
+            echo "E2E: ${{ needs.e2e-tests.result }}"
+            echo "Lint: ${{ needs.lint.result }}"
+            echo "Build: ${{ needs.build.result }}"
+            exit 1
+          fi

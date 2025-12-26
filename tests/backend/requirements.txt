@@ -1,0 +1,30 @@
+# Backend API Testing Dependencies
+
+# Core testing framework
+pytest==8.0.0
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+
+# HTTP client for API testing
+httpx==0.26.0
+requests==2.31.0
+
+# FastAPI testing utilities
+fastapi[all]==0.109.0
+
+# Database and mocking
+fakeredis==2.21.1
+pytest-redis==3.0.2
+
+# Test utilities
+factory-boy==3.3.0
+faker==22.0.0
+
+# Code quality
+pytest-xdist==3.5.0  # Parallel test execution
+pytest-timeout==2.2.0
+
+# Reporting
+pytest-html==4.1.1
+pytest-json-report==1.5.0
