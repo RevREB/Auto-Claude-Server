@@ -21,6 +21,7 @@ services:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - AUTO_BUILD_MODEL=${AUTO_BUILD_MODEL:-claude-opus-4-5-20251101}
+      - OLLAMA_BASE_URL=http://ollama:11434
       - PYTHONUNBUFFERED=1
     networks:
       - auto-claude-net
@@ -68,6 +69,18 @@ services:
       - auto-claude-net
     restart: unless-stopped
 
+  # Ollama for local embeddings (semantic search in memory)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: auto-claude-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - auto-claude-net
+    restart: unless-stopped
+
   # Redis for task queuing and session management
   redis:
     image: redis:7-alpine
@@ -88,6 +101,9 @@ volumes:
   auto-claude-data:
     driver: local
     # Stores Auto-Claude state - maps to PVC in Kubernetes
+  ollama-data:
+    driver: local
+    # Stores Ollama models for embeddings
   redis-data:
     driver: local
     # Stores Redis data - maps to PVC in Kubernetes

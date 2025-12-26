@@ -652,9 +652,15 @@ export interface BackendAPI {
   }>>;
   pullOllamaModel: (modelName: string, baseUrl?: string) => Promise<ApiResult<{
     model: string;
-    status: 'completed' | 'failed';
-    output: string[];
+    status: 'started' | 'completed' | 'failed';
+    message?: string;
+    output?: string[];
   }>>;
+
+  // Ollama Pull Progress Event Listeners
+  onOllamaPullProgress?: (callback: (data: { model: string; status: string; digest: string; total: number; completed: number }) => void) => (() => void) | undefined;
+  onOllamaPullComplete?: (callback: (data: { model: string; success: boolean }) => void) => (() => void) | undefined;
+  onOllamaPullError?: (callback: (data: { model: string; error: string }) => void) => (() => void) | undefined;
 }
 
 declare global {

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Check,
   Download,
@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { cn } from '../../lib/utils';
+import { Progress } from '../ui/progress';
 
 interface OllamaModel {
   name: string;
@@ -65,6 +66,7 @@ export function OllamaModelSelector({
   const [models, setModels] = useState<OllamaModel[]>(RECOMMENDED_MODELS);
   const [isLoading, setIsLoading] = useState(true);
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<{ status: string; percent: number }>({ status: '', percent: 0 });
   const [error, setError] = useState<string | null>(null);
   const [ollamaAvailable, setOllamaAvailable] = useState(true);
 
@@ -129,24 +131,69 @@ export function OllamaModelSelector({
     return () => controller.abort();
   }, []);
 
-  const handleDownload = async (modelName: string) => {
+  const handleDownload = useCallback(async (modelName: string) => {
     setIsDownloading(modelName);
+    setDownloadProgress({ status: 'Starting download...', percent: 0 });
     setError(null);
+
+    // Set up progress listeners
+    const unsubProgress = window.api.onOllamaPullProgress?.((data) => {
+      if (data.model === modelName || data.model === `${modelName}:latest`) {
+        const percent = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 0;
+        setDownloadProgress({
+          status: data.status || 'Downloading...',
+          percent
+        });
+      }
+    });
+
+    const unsubComplete = window.api.onOllamaPullComplete?.((data) => {
+      if (data.model === modelName || data.model === `${modelName}:latest`) {
+        setDownloadProgress({ status: 'Complete!', percent: 100 });
+        setIsDownloading(null);
+        // Refresh the model list
+        checkInstalledModels();
+        // Cleanup listeners
+        unsubProgress?.();
+        unsubComplete?.();
+        unsubError?.();
+      }
+    });
+
+    const unsubError = window.api.onOllamaPullError?.((data) => {
+      if (data.model === modelName || data.model === `${modelName}:latest`) {
+        setError(data.error || `Failed to download ${modelName}`);
+        setIsDownloading(null);
+        setDownloadProgress({ status: '', percent: 0 });
+        // Cleanup listeners
+        unsubProgress?.();
+        unsubComplete?.();
+        unsubError?.();
+      }
+    });
 
     try {
       const result = await window.api.pullOllamaModel(modelName);
-      if (result?.success) {
-        // Refresh the model list
-        await checkInstalledModels();
-      } else {
-        setError(result?.error || `Failed to download ${modelName}`);
+      if (!result?.success && result?.data?.status !== 'started') {
+        setError(result?.error || `Failed to start download for ${modelName}`);
+        setIsDownloading(null);
+        setDownloadProgress({ status: '', percent: 0 });
+        // Cleanup listeners
+        unsubProgress?.();
+        unsubComplete?.();
+        unsubError?.();
       }
+      // If success with status: 'started', the progress events will handle the rest
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Download failed');
-    } finally {
       setIsDownloading(null);
+      setDownloadProgress({ status: '', percent: 0 });
+      // Cleanup listeners
+      unsubProgress?.();
+      unsubComplete?.();
+      unsubError?.();
     }
-  };
+  }, []);
 
   const handleSelect = (model: OllamaModel) => {
     if (!model.installed || disabled) return;
@@ -244,25 +291,31 @@ export function OllamaModelSelector({
                 </div>
               </div>
 
-              {/* Download button for non-installed models */}
+              {/* Download button/progress for non-installed models */}
               {!model.installed && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDownload(model.name);
-                  }}
-                  disabled={isCurrentlyDownloading || disabled}
-                  className="shrink-0"
-                >
+                <div className="shrink-0 flex flex-col items-end gap-1">
                   {isCurrentlyDownloading ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                      Downloading...
-                    </>
+                    <div className="w-48 space-y-1">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground truncate max-w-[120px]">
+                          {downloadProgress.status || 'Downloading...'}
+                        </span>
+                        <span className="text-muted-foreground font-medium">
+                          {downloadProgress.percent}%
+                        </span>
+                      </div>
+                      <Progress value={downloadProgress.percent} className="h-2" />
+                    </div>
                   ) : (
-                    <>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDownload(model.name);
+                      }}
+                      disabled={isDownloading !== null || disabled}
+                    >
                       <Download className="h-3.5 w-3.5 mr-1.5" />
                       Download
                       {model.size_estimate && (
@@ -270,9 +323,9 @@ export function OllamaModelSelector({
                           ({model.size_estimate})
                         </span>
                       )}
-                    </>
+                    </Button>
                   )}
-                </Button>
+                </div>
               )}
             </div>
           );

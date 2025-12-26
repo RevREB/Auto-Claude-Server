@@ -90,9 +90,9 @@ export function AuthTerminal({ profileId, onClose, onTokenReceived }: AuthTermin
             if (message.type === 'output') {
               term.write(message.data);
             } else if (message.type === 'token_extracted') {
-              // Token was found in terminal output!
+              // Token was found in terminal output or credentials file!
               console.log('[AuthTerminal] Token extracted! Calling callback...');
-              term.writeln('\n\x1b[32m✓ Token extracted from output!\x1b[0m');
+              term.writeln('\n\x1b[32m✓ Token captured!\x1b[0m');
 
               // Call the callback immediately
               if (onTokenReceived) {
@@ -103,6 +103,15 @@ export function AuthTerminal({ profileId, onClose, onTokenReceived }: AuthTermin
                   onClose();
                 }, 2000);
               }
+            } else if (message.type === 'auth_completed') {
+              // OAuth login completed successfully
+              console.log('[AuthTerminal] Auth completed!');
+              term.writeln('\n\x1b[32m✓ Authentication successful!\x1b[0m');
+
+              // Auto-close modal after a short delay
+              setTimeout(() => {
+                onClose();
+              }, 2000);
             }
           };
 

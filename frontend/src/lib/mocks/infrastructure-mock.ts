@@ -122,6 +122,34 @@ export const infrastructureMock = {
     }
   },
 
+  // Ollama Pull Progress Event Listeners
+  onOllamaPullProgress: (callback: (data: { model: string; status: string; digest: string; total: number; completed: number }) => void) => {
+    const handler = (event: { event: string; data: { model: string; status: string; digest: string; total: number; completed: number } }) => {
+      if (event.event === 'ollama.pull.progress') {
+        callback(event.data);
+      }
+    };
+    return wsService.on('*', handler);
+  },
+
+  onOllamaPullComplete: (callback: (data: { model: string; success: boolean }) => void) => {
+    const handler = (event: { event: string; data: { model: string; success: boolean } }) => {
+      if (event.event === 'ollama.pull.complete') {
+        callback(event.data);
+      }
+    };
+    return wsService.on('*', handler);
+  },
+
+  onOllamaPullError: (callback: (data: { model: string; error: string }) => void) => {
+    const handler = (event: { event: string; data: { model: string; error: string } }) => {
+      if (event.event === 'ollama.pull.error') {
+        callback(event.data);
+      }
+    };
+    return wsService.on('*', handler);
+  },
+
   // Ideation Operations
   getIdeation: async (projectId: string) => {
     try {

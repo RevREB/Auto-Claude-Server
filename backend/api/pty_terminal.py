@@ -178,6 +178,11 @@ async def terminal_websocket(websocket: WebSocket, session_id: str):
     async def read_from_pty():
         """Read from PTY and send to WebSocket."""
         import re
+        import json
+        from pathlib import Path
+
+        auth_completed = False
+
         try:
             async for data in pty_session.read():
                 # Send terminal output to client
@@ -186,7 +191,7 @@ async def terminal_websocket(websocket: WebSocket, session_id: str):
                     "data": data
                 })
 
-                # Check for OAuth token in output (sk-ant-oat01-...)
+                # Check for OAuth token in output (sk-ant-oat01-...) - for setup-token mode
                 token_match = re.search(r'(sk-ant-oat01-[A-Za-z0-9_-]+)', data)
                 if token_match:
                     token = token_match.group(1)
@@ -196,15 +201,62 @@ async def terminal_websocket(websocket: WebSocket, session_id: str):
 
                     # Also send token directly via WebSocket
                     try:
-                        # Small delay to ensure message is sent before connection might close
                         await asyncio.sleep(0.1)
                         await websocket.send_json({
                             "type": "token_extracted",
                             "token": token
                         })
                         print(f"DEBUG: Sent token_extracted message via WebSocket")
+                        auth_completed = True
                     except Exception as e:
                         print(f"ERROR: Failed to send token via WebSocket: {e}")
+
+                # Check for claude login completion messages
+                # These indicate OAuth login succeeded and token was saved to credentials file
+                if not auth_completed and any(phrase in data.lower() for phrase in [
+                    "logged in as",
+                    "login successful",
+                    "successfully authenticated",
+                    "authentication successful",
+                    "you are now logged in"
+                ]):
+                    print(f"DEBUG: Detected login success message in output")
+                    # Try to read token from credentials file
+                    creds_paths = [
+                        Path("/root/.claude/.credentials.json"),
+                        Path.home() / ".claude" / ".credentials.json",
+                    ]
+                    for creds_path in creds_paths:
+                        if creds_path.exists():
+                            try:
+                                creds_data = json.loads(creds_path.read_text())
+                                # Token can be in different locations depending on auth method
+                                token = (
+                                    creds_data.get("claudeAiOauth", {}).get("accessToken") or
+                                    creds_data.get("oauthAccessToken") or
+                                    creds_data.get("accessToken")
+                                )
+                                if token:
+                                    session_data["extracted_token"] = token
+                                    print(f"DEBUG: Read token from credentials file: {token[:20]}...")
+                                    try:
+                                        await asyncio.sleep(0.1)
+                                        await websocket.send_json({
+                                            "type": "token_extracted",
+                                            "token": token
+                                        })
+                                        await websocket.send_json({
+                                            "type": "auth_completed",
+                                            "success": True
+                                        })
+                                        print(f"DEBUG: Sent auth_completed message via WebSocket")
+                                        auth_completed = True
+                                    except Exception as e:
+                                        print(f"ERROR: Failed to send auth message via WebSocket: {e}")
+                                    break
+                            except Exception as e:
+                                print(f"DEBUG: Failed to read credentials from {creds_path}: {e}")
+
         except Exception as e:
             print(f"Error reading from PTY: {e}")
 

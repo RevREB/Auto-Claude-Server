@@ -909,6 +909,155 @@ def register_handlers(app_state: dict):
             return {"error": str(e)}
 
     # =========================================================================
+    # INFRASTRUCTURE (Ollama, etc.)
+    # =========================================================================
+
+    async def infrastructure_check_ollama(conn_id: str, payload: dict) -> dict:
+        """Check if Ollama is running and list available models."""
+        import httpx
+        import os
+
+        # Use env var or default - backend connects to ollama container
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434")
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Check if Ollama is running
+                resp = await client.get(f"{base_url}/api/tags")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = data.get("models", [])
+
+                    # Filter for embedding models
+                    embedding_models = []
+                    for model in models:
+                        name = model.get("name", "")
+                        # Common embedding model patterns
+                        if any(x in name.lower() for x in ["embed", "nomic", "bge", "e5", "gte"]):
+                            embedding_models.append({
+                                "name": name,
+                                "size": model.get("size", 0),
+                                "family": model.get("details", {}).get("family", "unknown")
+                            })
+
+                    return {
+                        "running": True,
+                        "baseUrl": base_url,
+                        "models": models,
+                        "embeddingModels": embedding_models
+                    }
+                else:
+                    return {
+                        "running": False,
+                        "message": f"Ollama returned status {resp.status_code}"
+                    }
+        except Exception as e:
+            print(f"[Infrastructure] Ollama check failed: {e}")
+            return {
+                "running": False,
+                "message": f"Cannot connect to Ollama at {base_url}: {str(e)}"
+            }
+
+    async def infrastructure_pull_ollama_model(conn_id: str, payload: dict) -> dict:
+        """Pull (download) an Ollama model with streaming progress."""
+        import httpx
+        import os
+        import json as json_module
+
+        model_name = payload.get("modelName")
+        if not model_name:
+            return {"success": False, "error": "modelName required"}
+
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434")
+        print(f"[Infrastructure] Pulling Ollama model: {model_name}")
+
+        async def pull_with_progress():
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{base_url}/api/pull",
+                        json={"name": model_name, "stream": True}
+                    ) as resp:
+                        if resp.status_code != 200:
+                            error_msg = await resp.aread()
+                            await ws_manager.broadcast_event("ollama.pull.error", {
+                                "model": model_name,
+                                "error": error_msg.decode()
+                            })
+                            return
+
+                        async for line in resp.aiter_lines():
+                            if line:
+                                try:
+                                    progress = json_module.loads(line)
+                                    # Broadcast progress to frontend
+                                    await ws_manager.broadcast_event("ollama.pull.progress", {
+                                        "model": model_name,
+                                        "status": progress.get("status", ""),
+                                        "digest": progress.get("digest", ""),
+                                        "total": progress.get("total", 0),
+                                        "completed": progress.get("completed", 0)
+                                    })
+
+                                    # Check if complete
+                                    if progress.get("status") == "success":
+                                        print(f"[Infrastructure] Successfully pulled model: {model_name}")
+                                        await ws_manager.broadcast_event("ollama.pull.complete", {
+                                            "model": model_name,
+                                            "success": True
+                                        })
+                                except json_module.JSONDecodeError:
+                                    pass
+            except Exception as e:
+                print(f"[Infrastructure] Error pulling model: {e}")
+                await ws_manager.broadcast_event("ollama.pull.error", {
+                    "model": model_name,
+                    "error": str(e)
+                })
+
+        # Start the pull in background and return immediately
+        asyncio.create_task(pull_with_progress())
+
+        return {
+            "success": True,
+            "status": "started",
+            "message": f"Started pulling {model_name}. Progress will be streamed via WebSocket events."
+        }
+
+    async def infrastructure_list_ollama_embeddings(conn_id: str, payload: dict) -> dict:
+        """List Ollama embedding models."""
+        import httpx
+        import os
+
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434")
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{base_url}/api/tags")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = data.get("models", [])
+
+                    # Filter for embedding models
+                    embedding_models = []
+                    for model in models:
+                        name = model.get("name", "")
+                        if any(x in name.lower() for x in ["embed", "nomic", "bge", "e5", "gte"]):
+                            embedding_models.append({
+                                "name": name,
+                                "size": model.get("size", 0),
+                                "family": model.get("details", {}).get("family", "unknown")
+                            })
+
+                    return {"embedding_models": embedding_models, "count": len(embedding_models)}
+                else:
+                    return {"embedding_models": [], "count": 0}
+        except Exception as e:
+            print(f"[Infrastructure] Error listing embedding models: {e}")
+            return {"embedding_models": [], "count": 0}
+
+    # =========================================================================
     # WORKSPACE (Worktrees)
     # =========================================================================
 
@@ -1308,6 +1457,11 @@ def register_handlers(app_state: dict):
         "github.checkAuth": github_check_auth,
         "github.startAuth": github_start_auth,
         "github.getToken": github_get_token,
+
+        # Infrastructure
+        "infrastructure.checkOllama": infrastructure_check_ollama,
+        "infrastructure.pullOllamaModel": infrastructure_pull_ollama_model,
+        "infrastructure.listOllamaEmbeddings": infrastructure_list_ollama_embeddings,
 
         # Workspace
         "workspace.getStatus": workspace_get_status,
