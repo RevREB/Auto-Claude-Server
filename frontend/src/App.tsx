@@ -38,6 +38,7 @@ import { UsageIndicator } from './components/UsageIndicator';
 import { ProactiveSwapListener } from './components/ProactiveSwapListener';
 import { GitHubSetupModal } from './components/GitHubSetupModal';
 import { VersionCheck } from './components/VersionCheck';
+import { AddProjectModal } from './components/AddProjectModal';
 import { useProjectStore, loadProjects, addProject, initializeProject } from './stores/project-store';
 import { useTaskStore, loadTasks, reconcileTasks, setActiveProjectForTasks } from './stores/task-store';
 import { wsService } from './lib/websocket-service';
@@ -69,6 +70,7 @@ export function App() {
   const [settingsInitialProjectSection, setSettingsInitialProjectSection] = useState<ProjectSettingsSection | undefined>(undefined);
   const [activeView, setActiveView] = useState<SidebarView>('kanban');
   const [isOnboardingWizardOpen, setIsOnboardingWizardOpen] = useState(false);
+  const [isAddProjectModalOpen, setIsAddProjectModalOpen] = useState(false);
 
   // Initialize dialog state
   const [showInitDialog, setShowInitDialog] = useState(false);
@@ -369,6 +371,19 @@ export function App() {
     }
   };
 
+  const handleProjectAdded = (project: Project, needsInit: boolean) => {
+    // Open a tab for the new project
+    openProjectTab(project.id);
+
+    if (needsInit) {
+      // Project doesn't have Auto Claude initialized, show init dialog
+      setPendingProject(project);
+      setInitError(null);
+      setInitSuccess(false);
+      setShowInitDialog(true);
+    }
+  };
+
   const handleInitialize = async () => {
     if (!pendingProject) return;
 
@@ -502,23 +517,21 @@ export function App() {
                 </div>
               )}
             </div>
-            {selectedProject && (
-              <div className="electron-no-drag flex items-center gap-3">
-                <UsageIndicator />
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setIsSettingsDialogOpen(true)}
-                    >
-                      <Settings className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Settings</TooltipContent>
-                </Tooltip>
-              </div>
-            )}
+            <div className="electron-no-drag flex items-center gap-3">
+              {selectedProject && <UsageIndicator />}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setIsSettingsDialogOpen(true)}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Settings</TooltipContent>
+              </Tooltip>
+            </div>
           </header>
 
           {/* Main content area */}
@@ -581,7 +594,7 @@ export function App() {
             ) : (
               <WelcomeScreen
                 projects={projects}
-                onNewProject={handleAddProject}
+                onNewProject={() => setIsAddProjectModalOpen(true)}
                 onOpenProject={handleAddProject}
                 onSelectProject={(projectId) => {
                   openProjectTab(projectId);
@@ -718,6 +731,13 @@ export function App() {
             onSkip={handleGitHubSetupSkip}
           />
         )}
+
+        {/* Add Project Modal - for creating new projects or cloning repos */}
+        <AddProjectModal
+          open={isAddProjectModalOpen}
+          onOpenChange={setIsAddProjectModalOpen}
+          onProjectAdded={handleProjectAdded}
+        />
 
         {/* Rate Limit Modal - shows when Claude Code hits usage limits (terminal) */}
         <RateLimitModal />
