@@ -22,7 +22,7 @@ type ModalStep = 'choose' | 'create-form' | 'clone-form';
 interface AddProjectModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onProjectAdded?: (project: Project, needsInit: boolean) => void;
+  onProjectAdded?: (project: Project) => void;
 }
 
 export function AddProjectModal({ open, onOpenChange, onProjectAdded }: AddProjectModalProps) {
@@ -105,7 +105,7 @@ export function AddProjectModal({ open, onOpenChange, onProjectAdded }: AddProje
           setShowMigrationModal(true);
           onOpenChange(false); // Close the add project modal
         } else {
-          onProjectAdded?.(project, !project.autoBuildPath);
+          onProjectAdded?.(project);
           onOpenChange(false);
         }
       }
@@ -118,7 +118,7 @@ export function AddProjectModal({ open, onOpenChange, onProjectAdded }: AddProje
 
   const handleMigrationComplete = () => {
     if (clonedProject) {
-      onProjectAdded?.(clonedProject, !clonedProject.autoBuildPath);
+      onProjectAdded?.(clonedProject);
     }
     setShowMigrationModal(false);
     setClonedProject(null);
@@ -127,7 +127,7 @@ export function AddProjectModal({ open, onOpenChange, onProjectAdded }: AddProje
 
   const handleMigrationSkip = () => {
     if (clonedProject) {
-      onProjectAdded?.(clonedProject, !clonedProject.autoBuildPath);
+      onProjectAdded?.(clonedProject);
     }
     setShowMigrationModal(false);
     setClonedProject(null);
@@ -190,7 +190,7 @@ export function AddProjectModal({ open, onOpenChange, onProjectAdded }: AddProje
             // Non-fatal - main branch can be set later in settings
           }
         }
-        onProjectAdded?.(project, true); // New projects always need init
+        onProjectAdded?.(project);
         onOpenChange(false);
       }
     } catch (err) {

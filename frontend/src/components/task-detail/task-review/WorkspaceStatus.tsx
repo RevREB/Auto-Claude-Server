@@ -77,7 +77,7 @@ export function WorkspaceStatus({
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-medium text-sm text-foreground flex items-center gap-2">
             <GitBranch className="h-4 w-4 text-purple-400" />
-            Build Ready for Review
+            Feature Branch Ready for Review
           </h3>
           <div className="flex items-center gap-1">
             <Button
@@ -89,13 +89,14 @@ export function WorkspaceStatus({
               <Eye className="h-3.5 w-3.5 mr-1" />
               View
             </Button>
-            {worktreeStatus.worktreePath && (
+            {(worktreeStatus.workspacePath || worktreeStatus.worktreePath) && (
               <Button
                 variant="ghost"
                 size="sm"
                 onClick={() => {
                   // Open in code-server
-                  window.open(`http://localhost:8080/?folder=${encodeURIComponent(worktreeStatus.worktreePath!)}`, '_blank');
+                  const path = worktreeStatus.workspacePath || worktreeStatus.worktreePath;
+                  window.open(`http://localhost:8080/?folder=${encodeURIComponent(path!)}`, '_blank');
                 }}
                 className="h-7 px-2"
                 title="Open in Code-Server"
@@ -161,8 +162,11 @@ export function WorkspaceStatus({
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  // Open project root in code-server
-                  const projectPath = worktreeStatus.worktreePath?.replace('.worktrees/' + task.specId, '') || '';
+                  // Open project root in code-server - handle both clone and worktree paths
+                  const wsPath = worktreeStatus.workspacePath || worktreeStatus.worktreePath || '';
+                  const projectPath = wsPath.includes('/tmp/auto-claude/')
+                    ? wsPath.split('/').slice(0, -1).join('/')  // Clone: go up one level
+                    : wsPath.replace('.worktrees/' + task.specId, '');  // Worktree: remove worktree suffix
                   window.open(`http://localhost:8080/?folder=${encodeURIComponent(projectPath)}`, '_blank');
                 }}
                 className="text-xs h-6 mt-2"
@@ -297,7 +301,7 @@ export function WorkspaceStatus({
                 <GitMerge className="mr-2 h-4 w-4" />
                 {hasGitConflicts
                   ? (stageOnly ? 'Stage with AI Merge' : 'Merge with AI')
-                  : (stageOnly ? 'Stage Changes' : 'Merge to Main')}
+                  : (stageOnly ? 'Stage Changes' : `Merge to ${worktreeStatus.baseBranch || 'dev'}`)}
               </>
             )}
           </Button>

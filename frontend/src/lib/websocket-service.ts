@@ -318,6 +318,9 @@ export const wsApi = {
     delete: (taskId: string) =>
       wsService.send('tasks.delete', { taskId }),
 
+    plan: (taskId: string) =>
+      wsService.send('tasks.plan', { taskId }),
+
     start: (taskId: string) =>
       wsService.send('tasks.start', { taskId }),
 

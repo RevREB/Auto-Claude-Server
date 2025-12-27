@@ -28,17 +28,29 @@ _token_refresh_task: asyncio.Task | None = None
 TOKEN_REFRESH_INTERVAL_SECONDS = 30 * 60  # 30 minutes
 from .database import (
     init_db, migrate_from_json, migrate_spec_files, migrate_all_project_specs,
-    ProjectService, TaskService, SettingsService, TabStateService, SpecService
+    ProjectService, TaskService, SettingsService, TabStateService, SpecService,
+    SubtaskService, ReleaseService
 )
 from .git_state import GitStateManager, collect_spec_data, restore_spec_data
 import uuid
 import traceback
 import sys
 
-# Add auto-claude to path for QA imports
+# Add auto-claude to path FIRST - required for all core module imports
+# The directory has a hyphen which Python can't import directly as a package
 _AUTO_CLAUDE_DIR = Path(__file__).parent.parent / "auto-claude"
 if str(_AUTO_CLAUDE_DIR) not in sys.path:
     sys.path.insert(0, str(_AUTO_CLAUDE_DIR))
+
+# Import CloneManager for isolated task execution (clone-based, not worktrees)
+try:
+    from core.clone_manager import CloneManager, get_clone_manager
+    print("[main.py] CloneManager imported successfully - using clone-based execution")
+except ImportError as e:
+    # Fallback if running outside container
+    print(f"[main.py] CloneManager import failed: {e} - falling back to worktrees")
+    CloneManager = None
+    get_clone_manager = None
 
 
 async def _token_refresh_loop():
@@ -144,7 +156,7 @@ class Task(BaseModel):
     spec_id: str
     title: str
     description: str
-    status: str  # backlog, in_progress, ai_review, human_review, done
+    status: str  # backlog, planning, in_progress, ai_review, human_review, done
     project_id: str
 
 class TaskCreateRequest(BaseModel):
@@ -179,6 +191,96 @@ class ProjectCreateFolderRequest(BaseModel):
 
 class ProjectSettingsUpdate(BaseModel):
     settings: dict
+
+
+class TaskStore:
+    """
+    Database-backed task store that provides dict-like access.
+
+    Eliminates in-memory caching issues by always reading from/writing to SQLite.
+    Provides the same interface as a dict for minimal code changes.
+    """
+
+    def __getitem__(self, task_id: str) -> Task:
+        """Get task by ID - reads from database."""
+        task_data = TaskService.get_by_id(task_id)
+        if task_data is None:
+            raise KeyError(f"Task {task_id} not found")
+        return self._dict_to_task(task_data)
+
+    def __setitem__(self, task_id: str, task: Task):
+        """Set/update task - writes to database."""
+        existing = TaskService.get_by_id(task_id)
+        if existing:
+            TaskService.update(task_id, {
+                "title": task.title,
+                "description": task.description,
+                "status": task.status,
+                "projectId": task.project_id,
+            })
+        else:
+            TaskService.create({
+                "id": task_id,
+                "specId": task.spec_id,
+                "projectId": task.project_id,
+                "title": task.title,
+                "description": task.description,
+                "status": task.status,
+            })
+
+    def __delitem__(self, task_id: str):
+        """Delete task from database."""
+        TaskService.delete(task_id)
+
+    def __contains__(self, task_id: str) -> bool:
+        """Check if task exists in database."""
+        return TaskService.get_by_id(task_id) is not None
+
+    def get(self, task_id: str, default=None) -> Optional[Task]:
+        """Get task or return default."""
+        try:
+            return self[task_id]
+        except KeyError:
+            return default
+
+    def keys(self):
+        """Get all task IDs."""
+        return [t["id"] for t in TaskService.get_all(include_archived=True)]
+
+    def values(self):
+        """Get all tasks."""
+        return [self._dict_to_task(t) for t in TaskService.get_all(include_archived=False)]
+
+    def items(self):
+        """Get all (task_id, task) pairs."""
+        return [(t["id"], self._dict_to_task(t)) for t in TaskService.get_all(include_archived=False)]
+
+    def __len__(self):
+        """Count tasks."""
+        return len(TaskService.get_all(include_archived=False))
+
+    def __iter__(self):
+        """Iterate over task IDs."""
+        return iter(self.keys())
+
+    def _dict_to_task(self, task_data: dict) -> Task:
+        """Convert database dict to Task object."""
+        return Task(
+            spec_id=task_data["specId"],
+            title=task_data["title"],
+            description=task_data.get("description", ""),
+            status=task_data["status"],
+            project_id=task_data["projectId"]
+        )
+
+    def update_status(self, task_id: str, status: str) -> Optional[Task]:
+        """Update just the status of a task. Returns updated task or None if not found."""
+        task_data = TaskService.get_by_id(task_id)
+        if task_data is None:
+            return None
+        TaskService.update(task_id, {"status": status})
+        task_data["status"] = status
+        return self._dict_to_task(task_data)
 
 class ProjectCreateRequest(BaseModel):
     path: str
@@ -240,31 +342,27 @@ def _save_settings(settings: dict):
         print(f"[Settings] Error saving settings: {e}")
 
 def _save_tasks(export_state: bool = False, project_id: str = None):
-    """Save all tasks to database (batch update from in-memory cache)
+    """Export task state to git if requested.
+
+    Note: Task data is now automatically persisted to SQLite via TaskStore.
+    This function only handles git state export.
 
     Args:
-        export_state: If True, also export state to git branch
+        export_state: If True, export state to git branch
         project_id: If provided with export_state, only export this project
     """
-    try:
-        for tid, task in tasks.items():
-            TaskService.update(tid, {
-                "title": task.title,
-                "description": task.description,
-                "status": task.status,
-            })
-        print(f"[Tasks] Saved {len(tasks)} tasks to database")
-
-        # Export state to git if requested
-        if export_state:
+    # Task data is already in database via TaskStore - no batch save needed
+    # Just handle git export if requested
+    if export_state:
+        try:
             if project_id:
                 _export_project_state(project_id)
             else:
                 # Export all projects
                 for pid in projects:
                     _export_project_state(pid)
-    except Exception as e:
-        print(f"[Tasks] Error saving tasks: {e}")
+        except Exception as e:
+            print(f"[Tasks] Error exporting state: {e}")
 
 def _save_task(task: Task):
     """Save a single task to database"""
@@ -468,15 +566,29 @@ async def _broadcast_task_event(action: str, task: Task, extra_data: dict = None
 
             # Include subtasks for tasks in ai_review, human_review or done status
             # This prevents the "incomplete" flag in the UI
-            if task.status in ("ai_review", "human_review", "done") and task.project_id in projects:
-                project_path = projects[task.project_id].path
-                subtasks = _get_subtasks_from_plan(project_path, task.spec_id)
+            if task.status in ("ai_review", "human_review", "done"):
+                subtasks = []
+                if task.project_id in projects:
+                    project_path = projects[task.project_id].path
+                    subtasks = _get_subtasks_from_plan(project_path, task.spec_id)
+
+                # If no subtasks found but task is complete, add a placeholder
+                # This happens when clone directories are cleaned up
+                if not subtasks:
+                    subtasks = [{
+                        "id": "task-complete",
+                        "title": "Task completed",
+                        "description": task.title,
+                        "status": "completed",
+                        "files": []
+                    }]
+
                 # Mark all subtasks as completed for finished tasks
                 for st in subtasks:
                     st["status"] = "completed"
-                if subtasks:
-                    task_data["subtasks"] = subtasks
-                    print(f"[Broadcast] Including {len(subtasks)} subtasks for {task.spec_id}")
+
+                task_data["subtasks"] = subtasks
+                print(f"[Broadcast] Including {len(subtasks)} subtasks for {task.spec_id}")
 
             await ws_manager.broadcast_event(
                 f"project.{task.project_id}.tasks",
@@ -499,25 +611,16 @@ def _broadcast_task_event_sync(action: str, task: Task, extra_data: dict = None)
         print(f"[Broadcast] Sync wrapper error: {e}")
 
 def _load_tasks_from_db():
-    """Load tasks from database into in-memory cache"""
-    global tasks
-    try:
-        db_tasks = TaskService.get_all(include_archived=False)
-        tasks = {
-            t["id"]: Task(
-                spec_id=t["specId"],
-                title=t["title"],
-                description=t.get("description", ""),
-                status=t["status"],
-                project_id=t["projectId"]
-            )
-            for t in db_tasks
-        }
-        print(f"[Tasks] Loaded {len(tasks)} tasks from database")
-        return True
-    except Exception as e:
-        print(f"[Tasks] Error loading tasks from database: {e}")
-    return False
+    """No-op: TaskStore now reads directly from database on each access.
+
+    This function is kept for API compatibility but does nothing.
+    Tasks are accessed via the global `tasks` TaskStore instance which
+    queries SQLite directly, eliminating caching/sync issues.
+    """
+    # TaskStore reads from database on demand - no preloading needed
+    task_count = len(tasks)  # This queries the database
+    print(f"[Tasks] TaskStore ready - {task_count} tasks in database")
+    return True
 
 
 def _sync_tasks_from_disk():
@@ -778,7 +881,7 @@ def _load_projects_from_db():
 # ============================================================================
 
 projects: Dict[str, Project] = {}
-tasks: Dict[str, Task] = {}
+tasks = TaskStore()  # Database-backed task store - no more caching issues
 active_builds: Dict[str, subprocess.Popen] = {}
 tab_state: Optional[TabState] = None
 
@@ -795,14 +898,14 @@ def _recover_orphaned_tasks():
         if task.status == "in_progress":
             print(f"[Tasks] Recovering orphaned task: {task.title} ({task_id[:8]}...)")
             task.status = "backlog"
+            # Save directly to database via TaskStore
+            tasks[task_id] = task
             recovered_count += 1
 
     if recovered_count > 0:
-        _save_tasks()
         print(f"[Tasks] Recovered {recovered_count} orphaned task(s)")
 
-# Recover any orphaned tasks from previous run
-_recover_orphaned_tasks()
+# Note: _recover_orphaned_tasks() is called in lifespan() after database init
 
 # ============================================================================
 # WebSocket Connection Manager
@@ -1291,11 +1394,24 @@ def _get_subtasks_from_plan(project_path: str, spec_id: str) -> list:
     """Read subtasks from implementation_plan.json"""
     subtasks = []
     try:
-        # Check worktree first, then specs directory
-        plan_paths = [
+        # Build list of paths to check - clone paths first, then project paths
+        plan_paths = []
+
+        # Check clone paths first (for clone-based execution)
+        clone_base = Path("/tmp/auto-claude")
+        if clone_base.exists():
+            for clone_dir in clone_base.iterdir():
+                if clone_dir.is_dir() and clone_dir.name.startswith(spec_id):
+                    # Direct clone path
+                    plan_paths.append(clone_dir / ".auto-claude" / "specs" / spec_id / "implementation_plan.json")
+                    # Nested worktree in clone
+                    plan_paths.append(clone_dir / ".worktrees" / spec_id / ".auto-claude" / "specs" / spec_id / "implementation_plan.json")
+
+        # Fall back to project paths
+        plan_paths.extend([
             Path(project_path) / ".worktrees" / spec_id / ".auto-claude" / "specs" / spec_id / "implementation_plan.json",
             Path(project_path) / ".auto-claude" / "specs" / spec_id / "implementation_plan.json",
-        ]
+        ])
 
         plan_data = None
         for plan_path in plan_paths:
@@ -1328,8 +1444,24 @@ def _sync_task_status_from_worktree(task: Task, project_path: str) -> tuple:
     Returns (updated_status, subtasks_with_status)"""
     subtasks = []
     try:
-        worktree_status_path = Path(project_path) / ".worktrees" / task.spec_id / ".auto-claude-status"
-        if worktree_status_path.exists():
+        # Find .auto-claude-status file - check clone paths first
+        worktree_status_path = None
+        clone_base = Path("/tmp/auto-claude")
+
+        if clone_base.exists():
+            for clone_dir in clone_base.iterdir():
+                if clone_dir.is_dir() and clone_dir.name.startswith(task.spec_id):
+                    # Check nested worktree in clone
+                    candidate = clone_dir / ".worktrees" / task.spec_id / ".auto-claude-status"
+                    if candidate.exists():
+                        worktree_status_path = candidate
+                        break
+
+        # Fall back to project path
+        if not worktree_status_path:
+            worktree_status_path = Path(project_path) / ".worktrees" / task.spec_id / ".auto-claude-status"
+
+        if worktree_status_path and worktree_status_path.exists():
             with open(worktree_status_path) as f:
                 status_data = json.load(f)
 
@@ -1364,38 +1496,111 @@ def _sync_task_status_from_worktree(task: Task, project_path: str) -> tuple:
     return subtasks
 
 def _get_execution_progress(project_path: str, spec_id: str) -> dict:
-    """Get execution progress from task_logs.json"""
+    """Get execution progress by checking spec files and task_logs.json.
+
+    Infers progress from spec directory contents when task_logs.json doesn't exist.
+    Checks clone path first for running tasks, then legacy worktree/project paths.
+    """
     try:
-        logs_path = Path(project_path) / ".auto-claude" / "specs" / spec_id / "task_logs.json"
-        if not logs_path.exists():
-            return None
+        # First find the spec directory
+        clone_base = Path("/tmp/auto-claude")
+        spec_dir = None
+        logs_path = None
 
-        with open(logs_path) as f:
-            logs_data = json.load(f)
+        if clone_base.exists():
+            # Find clone directory for this task
+            for clone_dir in clone_base.iterdir():
+                if clone_dir.is_dir() and clone_dir.name.startswith(spec_id):
+                    # Check direct clone path first
+                    candidate_spec = clone_dir / ".auto-claude" / "specs" / spec_id
+                    if candidate_spec.exists():
+                        spec_dir = candidate_spec
+                        logs_path = candidate_spec / "task_logs.json"
+                        break
+                    # Check nested worktree path (spec_runner creates this)
+                    candidate_spec = clone_dir / ".worktrees" / spec_id / ".auto-claude" / "specs" / spec_id
+                    if candidate_spec.exists():
+                        spec_dir = candidate_spec
+                        logs_path = candidate_spec / "task_logs.json"
+                        break
 
-        phases = logs_data.get("phases", {})
-        current_phase = "planning"
-        completed = 0
-        total = 3  # planning, coding, validation
+        # Fall back to legacy worktree path
+        if not spec_dir:
+            candidate_spec = Path(project_path) / ".worktrees" / spec_id / ".auto-claude" / "specs" / spec_id
+            if candidate_spec.exists():
+                spec_dir = candidate_spec
+                logs_path = candidate_spec / "task_logs.json"
 
-        if isinstance(phases, dict):
-            for phase_name, phase_data in phases.items():
-                if isinstance(phase_data, dict):
-                    status = phase_data.get("status", "pending")
-                    if status == "completed":
-                        completed += 1
-                    elif status in ["active", "in_progress", "running"]:
-                        current_phase = phase_name
-        elif isinstance(phases, list):
-            completed = len(phases) - 1 if phases else 0
-            current_phase = phases[-1] if phases else "planning"
+        # Fall back to project path
+        if not spec_dir:
+            candidate_spec = Path(project_path) / ".auto-claude" / "specs" / spec_id
+            if candidate_spec.exists():
+                spec_dir = candidate_spec
+                logs_path = candidate_spec / "task_logs.json"
 
-        return {
-            "phase": current_phase,
-            "completed": completed,
-            "total": total,
-            "inProgress": 1
-        }
+        # If we have task_logs.json, use it
+        if logs_path and logs_path.exists():
+            with open(logs_path) as f:
+                logs_data = json.load(f)
+
+            phases = logs_data.get("phases", {})
+            current_phase = "planning"
+            completed = 0
+            total = 3  # planning, coding, validation
+
+            if isinstance(phases, dict):
+                for phase_name, phase_data in phases.items():
+                    if isinstance(phase_data, dict):
+                        status = phase_data.get("status", "pending")
+                        if status == "completed":
+                            completed += 1
+                        elif status in ["active", "in_progress", "running"]:
+                            current_phase = phase_name
+            elif isinstance(phases, list):
+                completed = len(phases) - 1 if phases else 0
+                current_phase = phases[-1] if phases else "planning"
+
+            return {
+                "phase": current_phase,
+                "completed": completed,
+                "total": total,
+                "inProgress": 1
+            }
+
+        # No task_logs.json - infer progress from spec files
+        if spec_dir and spec_dir.exists():
+            has_complexity = (spec_dir / "complexity_assessment.json").exists()
+            has_impl_plan = (spec_dir / "implementation_plan.json").exists()
+            has_spec = (spec_dir / "spec.md").exists()
+            has_context = (spec_dir / "context.json").exists()
+
+            # Determine phase based on what files exist
+            if has_impl_plan or has_spec:
+                # Past planning, now coding
+                return {
+                    "phase": "coding",
+                    "completed": 1,
+                    "total": 3,
+                    "inProgress": 1
+                }
+            elif has_complexity or has_context:
+                # In planning phase
+                return {
+                    "phase": "planning",
+                    "completed": 0,
+                    "total": 3,
+                    "inProgress": 1
+                }
+            else:
+                # Just started
+                return {
+                    "phase": "planning",
+                    "completed": 0,
+                    "total": 3,
+                    "inProgress": 1
+                }
+
+        return None
     except Exception:
         return None
 
@@ -1422,6 +1627,23 @@ async def list_tasks(project_id: str):
 
             # Convert to frontend format with subtasks
             task_data = task_to_frontend(t)
+
+            # For completed tasks, ensure subtasks are present to avoid "incomplete" status
+            if t.status in ("ai_review", "human_review", "done"):
+                if not subtasks:
+                    # Add placeholder when no subtasks found (clone cleaned up)
+                    subtasks = [{
+                        "id": "task-complete",
+                        "title": "Task completed",
+                        "description": t.title,
+                        "status": "completed",
+                        "files": []
+                    }]
+                else:
+                    # Mark all subtasks as completed
+                    for st in subtasks:
+                        st["status"] = "completed"
+
             if subtasks:
                 task_data["subtasks"] = subtasks
             if execution_progress:
@@ -1453,7 +1675,7 @@ async def create_task(request: TaskCreateRequest):
         spec_id=spec_id,
         title=title,
         description=request.description,
-        status="backlog",  # Frontend expects: backlog, in_progress, ai_review, human_review, done
+        status="backlog",  # Frontend expects: backlog, planning, in_progress, ai_review, human_review, done
         project_id=request.projectId
     )
 
@@ -1490,7 +1712,7 @@ async def update_task(spec_id: str, updates: dict):
 
 @app.post("/api/tasks/{task_id}/start")
 async def start_task(task_id: str):
-    """Start executing a task - runs the auto-claude spec runner"""
+    """Start executing a task - runs the auto-claude spec runner in an isolated clone"""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -1510,54 +1732,130 @@ async def start_task(task_id: str):
     project = projects[task.project_id]
     project_path = Path(project.path)
 
+    # Determine the execution path (clone or direct)
+    # Use clone-based execution if CloneManager is available
+    clone_path = None
+    feature_branch = f"feature/{task_id}"
+
+    if get_clone_manager is not None:
+        try:
+            # Create a clone for isolated task execution
+            clone_mgr = get_clone_manager(project_path)
+
+            # Determine base branch (dev if hierarchical model, main otherwise)
+            base_branch = "dev"
+            try:
+                # Check if dev branch exists
+                result = subprocess.run(
+                    ["git", "rev-parse", "--verify", "dev"],
+                    cwd=project_path,
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode != 0:
+                    # Fall back to main/master
+                    base_branch = "main"
+            except Exception:
+                base_branch = "main"
+
+            clone_path = clone_mgr.create_clone(task_id, feature_branch, base_branch)
+            print(f"[Task Runner] Created clone at {clone_path} on branch {feature_branch}")
+
+            # Store clone info for later reference
+            TaskService.update(task_id, {"feature_branch": feature_branch})
+
+        except Exception as e:
+            print(f"[Task Runner] Failed to create clone, falling back to direct execution: {e}")
+            clone_path = None
+
+    # Use clone path if available, otherwise project path
+    execution_path = clone_path if clone_path else project_path
+
     # Create .auto-claude/specs directory if it doesn't exist
-    specs_dir = project_path / ".auto-claude" / "specs"
+    specs_dir = execution_path / ".auto-claude" / "specs"
     specs_dir.mkdir(parents=True, exist_ok=True)
 
     # Create spec directory for this task
     spec_dir = specs_dir / task_id
     spec_dir.mkdir(exist_ok=True)
 
-    # Write task description to spec file
-    spec_file = spec_dir / "task.md"
-    spec_content = f"""# {task.title}
+    # Check if plan already exists (from pre-planning phase)
+    # Plans are created in project directory during planning phase
+    project_spec_dir = project_path / ".auto-claude" / "specs" / task_id
+    plan_exists = (project_spec_dir / "implementation_plan.json").exists()
+    skip_planning = plan_exists
+
+    # If plan exists and we're using a clone, copy the spec directory to clone
+    if plan_exists and clone_path and project_spec_dir != spec_dir:
+        import shutil
+        print(f"[Task Runner] Plan already exists, copying spec to clone...")
+        # Copy all spec files from project to clone
+        if project_spec_dir.exists():
+            for item in project_spec_dir.iterdir():
+                dest = spec_dir / item.name
+                if item.is_file():
+                    shutil.copy2(item, dest)
+                elif item.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(item, dest)
+            print(f"[Task Runner] Copied spec from {project_spec_dir} to {spec_dir}")
+    elif not plan_exists:
+        # Write task description to spec file (only if no plan exists)
+        spec_file = spec_dir / "task.md"
+        spec_content = f"""# {task.title}
 
 {task.description}
 """
-    spec_file.write_text(spec_content)
+        spec_file.write_text(spec_content)
 
-    # Update task status
-    task.status = "in_progress"
-    _save_tasks()
+    # Update task status in database
+    task = tasks.update_status(task_id, "in_progress")
 
-    # Reset worktree status file to prevent stale "complete" state from previous runs
-    worktree_status_path = project_path / ".worktrees" / task_id / ".auto-claude-status"
-    if worktree_status_path.exists():
-        try:
-            worktree_status_path.unlink()
-            print(f"[Task Runner] Cleared stale worktree status for {task_id}")
-        except Exception as e:
-            print(f"[Task Runner] Failed to clear worktree status: {e}")
+    # Clear any stale status files (legacy worktree and clone status)
+    for status_dir in [project_path / ".worktrees" / task_id, execution_path]:
+        status_path = status_dir / ".auto-claude-status"
+        if status_path.exists():
+            try:
+                status_path.unlink()
+                print(f"[Task Runner] Cleared stale status for {task_id}")
+            except Exception as e:
+                print(f"[Task Runner] Failed to clear status: {e}")
 
     # Broadcast task started
-    await _broadcast_task_event("updated", task)
+    await _broadcast_task_event("updated", task, {
+        "featureBranch": feature_branch,
+        "clonePath": str(clone_path) if clone_path else None
+    })
 
-    # Build the command to run spec_runner.py
-    spec_runner_path = Path("/app/auto-claude/runners/spec_runner.py")
-
-    # Prepare environment with OAuth token
+    # Prepare environment
     env = os.environ.copy()
 
-    cmd = [
-        "python3",
-        str(spec_runner_path),
-        "--task", task.description,
-        "--project-dir", str(project_path),
-        "--spec-dir", str(spec_dir),
-        "--auto-approve",  # Skip human review for automated execution
-    ]
+    # Determine which script to run based on whether planning is already done
+    if skip_planning:
+        # Plan exists - skip to execution phase (run.py)
+        run_script_path = Path("/app/auto-claude/run.py")
+        cmd = [
+            "python3",
+            str(run_script_path),
+            "--spec", task_id,
+            "--project-dir", str(execution_path),
+            "--auto-continue",  # Non-interactive mode
+        ]
+        print(f"[Task Runner] Plan exists, skipping to execution for task {task_id}")
+    else:
+        # No plan - run full spec_runner.py (planning + execution)
+        spec_runner_path = Path("/app/auto-claude/runners/spec_runner.py")
+        cmd = [
+            "python3",
+            str(spec_runner_path),
+            "--task", task.description,
+            "--project-dir", str(execution_path),
+            "--spec-dir", str(spec_dir),
+            "--auto-approve",  # Skip human review for automated execution
+        ]
 
-    print(f"[Task Runner] Starting task {task_id}: {' '.join(cmd)}")
+    print(f"[Task Runner] Starting task {task_id} in {execution_path}: {' '.join(cmd)}")
 
     try:
         # Start the process
@@ -1574,28 +1872,268 @@ async def start_task(task_id: str):
         print(f"[Task Runner] Process started with PID {proc.pid}")
 
         # Start background task to monitor the process
-        asyncio.create_task(_monitor_task_process(task_id, proc))
+        asyncio.create_task(_monitor_task_process(
+            task_id,
+            proc,
+            clone_path=clone_path,
+            feature_branch=feature_branch
+        ))
 
         return {
             "success": True,
             "data": {
                 "message": "Task started",
                 "taskId": task_id,
-                "pid": proc.pid
+                "pid": proc.pid,
+                "featureBranch": feature_branch,
+                "clonePath": str(clone_path) if clone_path else None
             }
         }
     except Exception as e:
         print(f"[Task Runner] Failed to start task: {e}")
-        task.status = "backlog"
-        _save_tasks()
+        # Clean up clone on failure
+        if clone_path and get_clone_manager:
+            try:
+                clone_mgr = get_clone_manager(project_path)
+                clone_mgr.cleanup_clone(task_id)
+            except Exception:
+                pass
+        tasks.update_status(task_id, "backlog")
         raise HTTPException(status_code=500, detail=f"Failed to start task: {str(e)}")
 
 
-async def _monitor_task_process(task_id: str, proc: subprocess.Popen):
+@app.post("/api/tasks/{task_id}/plan")
+async def plan_task(task_id: str):
+    """Start planning for a task - runs spec_runner in planning-only mode (no build)
+
+    This creates a spec/plan in the background. When complete, task moves to
+    human_review with reason='plan_review' for the user to approve before execution.
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+
+    # Check if already running
+    if task_id in active_builds:
+        return {
+            "success": False,
+            "error": "Task is already running"
+        }
+
+    # Check if already planned (has implementation_plan.json)
+    if task.project_id in projects:
+        project_path = Path(projects[task.project_id].path)
+        spec_dir = project_path / ".auto-claude" / "specs" / task_id
+        if (spec_dir / "implementation_plan.json").exists():
+            return {
+                "success": False,
+                "error": "Task already has a plan. Use start to execute."
+            }
+
+    # Get the project
+    if task.project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[task.project_id]
+    project_path = Path(project.path)
+
+    # For planning, we don't need a full clone - just work in project directory
+    # The plan will be stored in .auto-claude/specs/{task_id}/
+    execution_path = project_path
+
+    # Create .auto-claude/specs directory if it doesn't exist
+    specs_dir = execution_path / ".auto-claude" / "specs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create spec directory for this task
+    spec_dir = specs_dir / task_id
+    spec_dir.mkdir(exist_ok=True)
+
+    # Write task description to spec file
+    spec_file = spec_dir / "task.md"
+    spec_content = f"""# {task.title}
+
+{task.description}
+"""
+    spec_file.write_text(spec_content)
+
+    # Update task status to planning
+    task = tasks.update_status(task_id, "planning")
+
+    # Broadcast task status change
+    await _broadcast_task_event("updated", task)
+
+    # Build the command to run spec_runner.py in planning-only mode
+    spec_runner_path = Path("/app/auto-claude/runners/spec_runner.py")
+
+    # Prepare environment
+    env = os.environ.copy()
+
+    cmd = [
+        "python3",
+        str(spec_runner_path),
+        "--task", task.description,
+        "--project-dir", str(execution_path),
+        "--spec-dir", str(spec_dir),
+        "--no-build",  # Planning only - don't start execution
+        "--auto-approve",  # Auto-approve spec so plan gets generated
+    ]
+
+    print(f"[Task Planner] Starting planning for task {task_id}: {' '.join(cmd)}")
+
+    try:
+        # Start the process
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd="/app",
+            env=env
+        )
+
+        active_builds[task_id] = proc
+        print(f"[Task Planner] Process started with PID {proc.pid}")
+
+        # Start background task to monitor the planning process
+        asyncio.create_task(_monitor_plan_process(task_id, proc))
+
+        return {
+            "success": True,
+            "data": {
+                "message": "Planning started",
+                "taskId": task_id,
+                "pid": proc.pid
+            }
+        }
+    except Exception as e:
+        print(f"[Task Planner] Failed to start planning: {e}")
+        tasks.update_status(task_id, "backlog")
+        raise HTTPException(status_code=500, detail=f"Failed to start planning: {str(e)}")
+
+
+async def _monitor_plan_process(task_id: str, proc: subprocess.Popen):
+    """Monitor a planning process and update status when complete"""
+    import asyncio
+
+    print(f"[Plan Monitor] Started monitoring planning for task {task_id} (PID {proc.pid})")
+
+    poll_count = 0
+
+    # Get project info
+    project_path = None
+    project_id = None
+    if task_id in tasks:
+        project_id = tasks[task_id].project_id
+        if project_id in projects:
+            project_path = projects[project_id].path
+
+    try:
+        # Wait for process to complete
+        while proc.poll() is None:
+            poll_count += 1
+            if poll_count % 15 == 0:  # Log every 30 seconds
+                print(f"[Plan Monitor] Task {task_id} planning still running (PID {proc.pid})")
+
+            # Broadcast planning progress updates
+            if project_path and project_id:
+                try:
+                    progress = _get_execution_progress(project_path, task_id)
+                    if progress:
+                        from .websocket_handler import ws_manager
+                        if ws_manager:
+                            await ws_manager.broadcast_event(
+                                f"project.{project_id}.tasks",
+                                {
+                                    "action": "updated",
+                                    "task": {
+                                        "id": task_id,
+                                        "specId": task_id,
+                                        "projectId": project_id,
+                                        "status": "planning",
+                                        "executionProgress": progress
+                                    }
+                                }
+                            )
+                except Exception as e:
+                    if poll_count % 15 == 0:
+                        print(f"[Plan Monitor] Error reading progress: {e}")
+
+            await asyncio.sleep(2)
+
+        exit_code = proc.returncode
+        print(f"[Plan Monitor] Task {task_id} planning completed with exit code {exit_code}")
+
+        # Remove from active builds
+        if task_id in active_builds:
+            del active_builds[task_id]
+
+        # Update task status based on exit code
+        if task_id in tasks:
+            if exit_code == 0:
+                # Planning succeeded - move to human_review with plan_review reason
+                task = tasks[task_id]
+                task.status = "human_review"
+                task.review_reason = "plan_review"
+                tasks[task_id] = task  # Triggers database save
+                print(f"[Plan Monitor] Task {task_id} planning complete, moved to human_review (plan_review)")
+
+                # Schedule state export to git
+                schedule_state_export(project_id)
+            else:
+                task = tasks.update_status(task_id, "backlog")  # Failed, needs retry
+                print(f"[Plan Monitor] Task {task_id} planning failed, status set to backlog")
+
+            # Broadcast task status change via WebSocket
+            try:
+                from .websocket_handler import ws_manager
+                if ws_manager:
+                    task = tasks[task_id]
+                    task_data = {
+                        "id": task_id,
+                        "specId": task.spec_id,
+                        "projectId": task.project_id,
+                        "status": task.status,
+                        "title": task.title,
+                    }
+                    if hasattr(task, 'review_reason') and task.review_reason:
+                        task_data["reviewReason"] = task.review_reason
+
+                    asyncio.create_task(ws_manager.broadcast_event(
+                        f"project.{task.project_id}.tasks",
+                        {
+                            "action": "updated",
+                            "task": task_data
+                        }
+                    ))
+            except Exception as e:
+                print(f"[Plan Monitor] Failed to broadcast status update: {e}")
+
+    except Exception as e:
+        print(f"[Plan Monitor] Error monitoring planning: {e}")
+        # Clean up
+        if task_id in active_builds:
+            del active_builds[task_id]
+        try:
+            tasks.update_status(task_id, "backlog")
+        except Exception:
+            pass
+
+
+async def _monitor_task_process(
+    task_id: str,
+    proc: subprocess.Popen,
+    clone_path: Path = None,
+    feature_branch: str = None
+):
     """Monitor a running task process and update status when complete"""
     import asyncio
 
     print(f"[Task Monitor] Started monitoring task {task_id} (PID {proc.pid})")
+    if clone_path:
+        print(f"[Task Monitor] Clone path: {clone_path}, branch: {feature_branch}")
+
     poll_count = 0
     last_phase = None
 
@@ -1617,11 +2155,28 @@ async def _monitor_task_process(task_id: str, proc: subprocess.Popen):
             # Poll execution progress from task_logs.json and broadcast updates
             if project_path and project_id:
                 try:
-                    logs_path = Path(project_path) / ".auto-claude" / "specs" / task_id / "task_logs.json"
-                    if not logs_path.exists():
-                        logs_path = Path(project_path) / ".worktrees" / task_id / ".auto-claude" / "specs" / task_id / "task_logs.json"
+                    # Check multiple possible log locations
+                    logs_path = None
 
-                    if logs_path.exists():
+                    # First check clone path (if using clone-based execution)
+                    if clone_path:
+                        clone_logs = clone_path / ".auto-claude" / "specs" / task_id / "task_logs.json"
+                        if clone_logs.exists():
+                            logs_path = clone_logs
+
+                    # Fallback to project path
+                    if not logs_path:
+                        project_logs = Path(project_path) / ".auto-claude" / "specs" / task_id / "task_logs.json"
+                        if project_logs.exists():
+                            logs_path = project_logs
+
+                    # Legacy worktree path
+                    if not logs_path:
+                        worktree_logs = Path(project_path) / ".worktrees" / task_id / ".auto-claude" / "specs" / task_id / "task_logs.json"
+                        if worktree_logs.exists():
+                            logs_path = worktree_logs
+
+                    if logs_path and logs_path.exists():
                         with open(logs_path) as f:
                             logs_data = json.load(f)
 
@@ -1677,14 +2232,30 @@ async def _monitor_task_process(task_id: str, proc: subprocess.Popen):
         exit_code = proc.returncode
         print(f"[Task Monitor] Task {task_id} completed with exit code {exit_code}")
 
+        # If using clone-based execution, push the branch to remote
+        if clone_path and get_clone_manager and project_path:
+            try:
+                clone_mgr = get_clone_manager(project_path)
+                if exit_code == 0:
+                    # Task succeeded - push the branch
+                    push_success = clone_mgr.push_branch(task_id)
+                    if push_success:
+                        print(f"[Task Monitor] Pushed branch {feature_branch} to remote")
+                    else:
+                        print(f"[Task Monitor] Warning: Failed to push branch {feature_branch}")
+                else:
+                    # Task failed - clean up the clone
+                    clone_mgr.cleanup_clone(task_id)
+                    print(f"[Task Monitor] Cleaned up clone after task failure")
+            except Exception as push_err:
+                print(f"[Task Monitor] Error handling clone after completion: {push_err}")
+
         # Update task status based on exit code
         if task_id in tasks:
-            task = tasks[task_id]
             if exit_code == 0:
                 # First set to ai_review, then trigger AI QA validation
-                task.status = "ai_review"
+                task = tasks.update_status(task_id, "ai_review")
                 print(f"[Task Monitor] Task {task_id} status updated to ai_review")
-                _save_tasks()
 
                 # Schedule state export to git
                 schedule_state_export(project_id)
@@ -1692,9 +2263,8 @@ async def _monitor_task_process(task_id: str, proc: subprocess.Popen):
                 # Trigger AI review in the background
                 asyncio.create_task(_run_ai_review(task_id, project_id))
             else:
-                task.status = "backlog"  # Failed, needs retry
+                task = tasks.update_status(task_id, "backlog")  # Failed, needs retry
                 print(f"[Task Monitor] Task {task_id} failed, status set to backlog")
-                _save_tasks()
 
             # Broadcast task status change via WebSocket
             try:
@@ -1714,18 +2284,23 @@ async def _monitor_task_process(task_id: str, proc: subprocess.Popen):
                             for st in subtasks:
                                 st["status"] = "completed"
 
+                    task_data = {
+                        "id": task_id,
+                        "specId": task.spec_id,
+                        "projectId": task.project_id,
+                        "status": task.status,
+                        "title": task.title,
+                        "subtasks": subtasks
+                    }
+                    # Include feature branch info if available
+                    if feature_branch:
+                        task_data["featureBranch"] = feature_branch
+
                     asyncio.create_task(ws_manager.broadcast_event(
                         f"project.{task.project_id}.tasks",
                         {
                             "action": "updated",
-                            "task": {
-                                "id": task_id,
-                                "specId": task.spec_id,
-                                "projectId": task.project_id,
-                                "status": task.status,
-                                "title": task.title,
-                                "subtasks": subtasks
-                            }
+                            "task": task_data
                         }
                     ))
                     print(f"[Task Monitor] Broadcasted status update for task {task_id} with {len(subtasks)} subtasks")
@@ -1770,22 +2345,43 @@ async def _run_ai_review(task_id: str, project_id: str):
 
         if project_id not in projects:
             print(f"[AI Review] Project {project_id} not found")
-            # Fall back to human_review if we can't run AI review
-            task.status = "human_review"
-            _save_tasks()
-            await _broadcast_task_event("updated", task)
+            # Fall back to human_review - use update_status for DB persistence
+            task = tasks.update_status(task_id, "human_review")
+            if task:
+                await _broadcast_task_event("updated", task)
             return
 
         project = projects[project_id]
         project_path = Path(project.path)
-        spec_dir = project_path / ".auto-claude" / "specs" / task.spec_id
 
-        if not spec_dir.exists():
-            print(f"[AI Review] Spec directory not found: {spec_dir}")
-            # Fall back to human_review
-            task.status = "human_review"
-            _save_tasks()
-            await _broadcast_task_event("updated", task)
+        # Find spec directory - check clone paths first (for clone-based execution)
+        spec_dir = None
+        clone_base = Path("/tmp/auto-claude")
+
+        if clone_base.exists():
+            for clone_dir in clone_base.iterdir():
+                if clone_dir.is_dir() and clone_dir.name.startswith(task_id):
+                    # Check direct clone path
+                    candidate = clone_dir / ".auto-claude" / "specs" / task_id
+                    if candidate.exists():
+                        spec_dir = candidate
+                        break
+                    # Check nested worktree path
+                    candidate = clone_dir / ".worktrees" / task_id / ".auto-claude" / "specs" / task_id
+                    if candidate.exists():
+                        spec_dir = candidate
+                        break
+
+        # Fall back to project path
+        if not spec_dir:
+            spec_dir = project_path / ".auto-claude" / "specs" / task.spec_id
+
+        if not spec_dir or not spec_dir.exists():
+            print(f"[AI Review] Spec directory not found for task {task_id}")
+            # Fall back to human_review - use update_status for DB persistence
+            task = tasks.update_status(task_id, "human_review")
+            if task:
+                await _broadcast_task_event("updated", task)
             return
 
         # Import QA functions (lazy import to avoid circular deps)
@@ -1793,18 +2389,18 @@ async def _run_ai_review(task_id: str, project_id: str):
             from qa_loop import run_qa_validation_loop, should_run_qa
         except ImportError as e:
             print(f"[AI Review] Failed to import QA modules: {e}")
-            # Fall back to human_review
-            task.status = "human_review"
-            _save_tasks()
-            await _broadcast_task_event("updated", task)
+            # Fall back to human_review - use update_status for DB persistence
+            task = tasks.update_status(task_id, "human_review")
+            if task:
+                await _broadcast_task_event("updated", task)
             return
 
         # Check if QA should run
         if not should_run_qa(spec_dir):
             print(f"[AI Review] QA not needed for task {task_id} (already approved or incomplete)")
-            task.status = "human_review"
-            _save_tasks()
-            await _broadcast_task_event("updated", task)
+            task = tasks.update_status(task_id, "human_review")
+            if task:
+                await _broadcast_task_event("updated", task)
             return
 
         # Broadcast that AI review is starting
@@ -1835,16 +2431,15 @@ async def _run_ai_review(task_id: str, project_id: str):
 
             if qa_approved:
                 print(f"[AI Review] Task {task_id} PASSED QA review")
-                task.status = "human_review"
-                _save_tasks()
+                task = tasks.update_status(task_id, "human_review")
                 # Export state to git on significant status change
                 schedule_state_export(project_id)
-                await _broadcast_task_event("updated", task)
+                if task:
+                    await _broadcast_task_event("updated", task)
             else:
                 print(f"[AI Review] Task {task_id} FAILED QA review, sending back for fixes")
                 # Set back to in_progress with feedback
-                task.status = "in_progress"
-                _save_tasks()
+                task = tasks.update_status(task_id, "in_progress")
 
                 # Add feedback about QA failure
                 feedback = "AI QA review found issues that need to be addressed. Check the qa_report.md file in the spec directory for details."
@@ -1868,22 +2463,21 @@ async def _run_ai_review(task_id: str, project_id: str):
             print(f"[AI Review] QA validation error: {qa_error}")
             import traceback
             traceback.print_exc()
-            # Fall back to human_review on error
-            task.status = "human_review"
-            _save_tasks()
-            await _broadcast_task_event("updated", task)
+            # Fall back to human_review on error - use update_status for DB persistence
+            task = tasks.update_status(task_id, "human_review")
+            if task:
+                await _broadcast_task_event("updated", task)
 
     except Exception as e:
         print(f"[AI Review] Error during AI review for task {task_id}: {e}")
         import traceback
         traceback.print_exc()
 
-        # Try to fall back to human_review
-        if task_id in tasks:
-            tasks[task_id].status = "human_review"
-            _save_tasks()
+        # Try to fall back to human_review - use update_status for DB persistence
+        task = tasks.update_status(task_id, "human_review")
+        if task:
             try:
-                await _broadcast_task_event("updated", tasks[task_id])
+                await _broadcast_task_event("updated", task)
             except:
                 pass
 
@@ -1905,9 +2499,7 @@ async def stop_task(task_id: str):
         del active_builds[task_id]
 
     # Update task status back to backlog
-    task = tasks[task_id]
-    task.status = "backlog"
-    _save_tasks()
+    task = tasks.update_status(task_id, "backlog")
 
     # Broadcast task stopped
     await _broadcast_task_event("updated", task)
@@ -1981,9 +2573,9 @@ async def submit_task_review(task_id: str, review_data: dict):
         original_desc = task.description
         task.description = f"{original_desc}\n\n---\n**Feedback from review:**\n{feedback}"
 
-    # Set status back to backlog so it can be restarted
+    # Set status back to backlog and save to database
     task.status = "backlog"
-    _save_tasks()
+    tasks[task_id] = task  # Save full task including description update
 
     # Broadcast before restart (will broadcast again after start)
     await _broadcast_task_event("updated", task)
@@ -2061,8 +2653,7 @@ async def recover_task(task_id: str):
         }
 
     # Reset status to allow retry
-    task.status = "backlog"
-    _save_tasks()
+    task = tasks.update_status(task_id, "backlog")
 
     # Broadcast task recovered
     await _broadcast_task_event("updated", task)
@@ -2233,6 +2824,605 @@ async def get_task_spec(task_id: str, include_logs: bool = False):
     if not spec:
         raise HTTPException(status_code=404, detail="Spec not found for task")
     return {"success": True, "data": spec}
+
+
+# ============================================================================
+# Merge API Endpoints
+# ============================================================================
+
+@app.post("/api/subtasks/{subtask_id}/merge")
+async def merge_subtask(subtask_id: str, merge_data: dict = {}):
+    """
+    Merge a subtask branch into its parent feature branch.
+
+    Args:
+        subtask_id: Subtask ID
+        merge_data: Optional merge options (noCommit, message)
+
+    Returns:
+        Merge result
+    """
+    from dataclasses import asdict
+
+    # Get subtask from database
+    subtask = SubtaskService.get_by_id(subtask_id)
+    if not subtask:
+        raise HTTPException(status_code=404, detail="Subtask not found")
+
+    task_id = subtask.get("task_id")
+    if not task_id or task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Parent task not found")
+
+    task = tasks[task_id]
+    project = projects.get(task.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        # Import merge manager
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.merge_manager import get_merge_manager
+
+        manager = get_merge_manager(project.path)
+        result = manager.merge_subtask(
+            task_id,
+            subtask_id,
+            no_commit=merge_data.get("noCommit", False),
+            message=merge_data.get("message")
+        )
+
+        # Update subtask status if successful
+        if result.success:
+            SubtaskService.update(subtask_id, {
+                "status": "merged",
+                "merged_at": datetime.utcnow()
+            })
+
+        return {
+            "success": result.success,
+            "message": result.message,
+            "commitSha": result.commit_sha,
+            "mergedFiles": result.merged_files,
+            "hadConflicts": result.had_conflicts,
+            "conflicts": [asdict(c) for c in result.conflicts] if result.conflicts else []
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/tasks/{task_id}/merge")
+async def merge_task_to_dev(task_id: str, merge_data: dict = {}):
+    """
+    Merge a task's feature branch into dev.
+
+    Args:
+        task_id: Task ID
+        merge_data: Optional merge options (noCommit, message)
+
+    Returns:
+        Merge result
+    """
+    from dataclasses import asdict
+
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+    project = projects.get(task.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.merge_manager import get_merge_manager
+
+        manager = get_merge_manager(project.path)
+        result = manager.merge_feature_to_dev(
+            task_id,
+            no_commit=merge_data.get("noCommit", False),
+            message=merge_data.get("message")
+        )
+
+        # Update task status if successful
+        if result.success:
+            TaskService.update(task_id, {
+                "merged_to_dev_at": datetime.utcnow()
+            })
+            task.status = "done"
+            _save_tasks()
+
+            # Broadcast task update
+            await _broadcast_task_event("updated", task, {"mergedToDev": True})
+
+        return {
+            "success": result.success,
+            "message": result.message,
+            "commitSha": result.commit_sha,
+            "mergedFiles": result.merged_files,
+            "hadConflicts": result.had_conflicts,
+            "conflicts": [asdict(c) for c in result.conflicts] if result.conflicts else []
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tasks/{task_id}/merge-status")
+async def get_task_merge_status(task_id: str):
+    """
+    Get merge status for a task.
+
+    Returns information about the task's feature branch and merge readiness.
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+    project = projects.get(task.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.merge_manager import get_merge_manager
+
+        manager = get_merge_manager(project.path)
+        feature_branch = f"feature/{task_id}"
+
+        # Check if feature branch exists
+        branch_exists = manager._branch_exists(feature_branch, remote=True)
+
+        if branch_exists:
+            # Get merge preview against dev
+            preview = manager.preview_merge(feature_branch, "dev")
+            return {
+                "success": True,
+                "data": {
+                    "branchExists": True,
+                    "featureBranch": feature_branch,
+                    "canMergeToDev": preview.can_merge,
+                    "commitsAhead": preview.commits_ahead,
+                    "filesChanged": preview.files_changed,
+                    "additions": preview.additions,
+                    "deletions": preview.deletions,
+                    "hasConflicts": len(preview.conflicts) > 0
+                }
+            }
+        else:
+            return {
+                "success": True,
+                "data": {
+                    "branchExists": False,
+                    "featureBranch": feature_branch
+                }
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/tasks/{task_id}/merge-preview")
+async def preview_task_merge(task_id: str, preview_data: dict = {}):
+    """
+    Preview what merging a task would do.
+
+    Args:
+        task_id: Task ID
+        preview_data: Optional (sourceBranch, targetBranch)
+
+    Returns:
+        Merge preview with changed files, conflicts, etc.
+    """
+    from dataclasses import asdict
+
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+    project = projects.get(task.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_branch = preview_data.get("sourceBranch", f"feature/{task_id}")
+    target_branch = preview_data.get("targetBranch", "dev")
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.merge_manager import get_merge_manager
+
+        manager = get_merge_manager(project.path)
+        preview = manager.preview_merge(source_branch, target_branch)
+
+        return {
+            "success": True,
+            "data": {
+                "canMerge": preview.can_merge,
+                "sourceBranch": preview.source_branch,
+                "targetBranch": preview.target_branch,
+                "commitsAhead": preview.commits_ahead,
+                "filesChanged": preview.files_changed,
+                "additions": preview.additions,
+                "deletions": preview.deletions,
+                "conflicts": [asdict(c) for c in preview.conflicts] if preview.conflicts else [],
+                "changedFiles": preview.changed_files
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/projects/{project_id}/ensure-dev-branch")
+async def ensure_dev_branch(project_id: str, data: dict = {}):
+    """
+    Ensure the dev branch exists for a project.
+
+    Args:
+        project_id: Project ID
+        data: Optional (baseBranch)
+
+    Returns:
+        Success status
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+    base_branch = data.get("baseBranch", "main")
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.merge_manager import get_merge_manager
+
+        manager = get_merge_manager(project.path)
+        success = manager.ensure_dev_branch(base_branch)
+
+        return {
+            "success": success,
+            "message": "Dev branch ready" if success else "Failed to create dev branch"
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ============================================================================
+# Release API Endpoints
+# ============================================================================
+
+@app.get("/api/projects/{project_id}/releases")
+async def list_releases(project_id: str):
+    """
+    List all releases for a project.
+
+    Args:
+        project_id: Project ID
+
+    Returns:
+        List of releases
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        releases = manager.list_releases()
+
+        return {"success": True, "data": releases}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/projects/{project_id}/releases")
+async def create_release(project_id: str, release_data: dict):
+    """
+    Create a new release candidate.
+
+    Args:
+        project_id: Project ID
+        release_data: version, releaseNotes, taskIds
+
+    Returns:
+        Created release info
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+    version = release_data.get("version")
+    release_notes = release_data.get("releaseNotes")
+    task_ids = release_data.get("taskIds", [])
+
+    if not version:
+        raise HTTPException(status_code=400, detail="version required")
+
+    # Get task data
+    task_list = []
+    for task_id in task_ids:
+        if task_id in tasks:
+            task = tasks[task_id]
+            task_list.append({
+                "id": task_id,
+                "title": task.title,
+                "description": task.description,
+                "version_impact": "patch",
+                "is_breaking": False
+            })
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        result = manager.create_release(version, task_list, release_notes)
+
+        if result.success:
+            # Create release record in database
+            ReleaseService.create({
+                "version": version,
+                "branch_name": f"release/{version}",
+                "status": "candidate",
+                "release_notes": release_notes or (result.release.release_notes if result.release else None),
+                "created_at": datetime.utcnow()
+            })
+
+            # Associate tasks with release
+            for task_id in task_ids:
+                TaskService.update(task_id, {"release_version": version})
+                ReleaseService.add_task(version, task_id)
+
+            return {
+                "success": True,
+                "data": {
+                    "version": version,
+                    "branch": f"release/{version}",
+                    "status": "candidate",
+                    "releaseNotes": result.release.release_notes if result.release else None
+                }
+            }
+        else:
+            return {"success": False, "error": result.message}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/releases/{version}")
+async def get_release(version: str, project_id: str):
+    """
+    Get details of a specific release.
+
+    Args:
+        version: Version string
+        project_id: Project ID (query param)
+
+    Returns:
+        Release info
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        release = manager.get_release(version)
+
+        if release:
+            # Also get database record for additional info
+            db_release = ReleaseService.get_by_version(version)
+            if db_release:
+                release["releaseNotes"] = db_release.get("release_notes")
+                release["tasks"] = ReleaseService.get_tasks(version)
+
+            return {"success": True, "data": release}
+        else:
+            return {"success": False, "error": "Release not found"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/releases/{version}/promote")
+async def promote_release(version: str, project_id: str, promote_data: dict = {}):
+    """
+    Promote a release to main.
+
+    Args:
+        version: Version to promote
+        project_id: Project ID (query param)
+        promote_data: createTag, backMerge options
+
+    Returns:
+        Promotion result
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+    create_tag = promote_data.get("createTag", True)
+    back_merge = promote_data.get("backMerge", True)
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        result = manager.promote_to_main(version, create_tag, back_merge)
+
+        if result.success:
+            # Update database
+            ReleaseService.update(version, {
+                "status": "promoted",
+                "promoted_at": datetime.utcnow()
+            })
+
+            return {
+                "success": True,
+                "data": {
+                    "message": result.message,
+                    "tag": result.tag,
+                    "commitSha": result.commit_sha
+                }
+            }
+        else:
+            return {"success": False, "error": result.message}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/releases/{version}")
+async def abandon_release(version: str, project_id: str):
+    """
+    Abandon a release candidate.
+
+    Args:
+        version: Version to abandon
+        project_id: Project ID (query param)
+
+    Returns:
+        Abandon result
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        result = manager.abandon_release(version)
+
+        if result.success:
+            ReleaseService.update(version, {"status": "abandoned"})
+            return {"success": True, "data": {"message": result.message}}
+        else:
+            return {"success": False, "error": result.message}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/projects/{project_id}/version/current")
+async def get_current_version(project_id: str):
+    """
+    Get the current version for a project.
+
+    Args:
+        project_id: Project ID
+
+    Returns:
+        Current version string
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        version = manager.get_current_version()
+
+        return {"success": True, "data": {"version": version or "0.0.0"}}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/projects/{project_id}/version/next")
+async def get_next_version(project_id: str, version_data: dict = {}):
+    """
+    Calculate the next version based on tasks.
+
+    Args:
+        project_id: Project ID
+        version_data: taskIds to include
+
+    Returns:
+        Version calculation result
+    """
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects[project_id]
+    task_ids = version_data.get("taskIds", [])
+
+    # Get task data
+    task_list = []
+    for task_id in task_ids:
+        if task_id in tasks:
+            task = tasks[task_id]
+            task_list.append({
+                "id": task_id,
+                "title": task.title,
+                "description": task.description,
+                "version_impact": "patch",
+                "is_breaking": False
+            })
+
+    try:
+        import sys
+        auto_claude_path = Path("/app/auto-claude")
+        if str(auto_claude_path) not in sys.path:
+            sys.path.insert(0, str(auto_claude_path))
+
+        from core.release_manager import get_release_manager
+
+        manager = get_release_manager(project.path)
+        result = manager.get_next_version(task_list)
+
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ============================================================================

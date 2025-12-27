@@ -337,6 +337,164 @@ export const githubApi = {
 };
 
 // ============================================================================
+// MERGE API (Hierarchical Branch Model)
+// ============================================================================
+
+export interface MergeConflict {
+  file: string;
+  conflictType: string;
+  canAutoResolve: boolean;
+}
+
+export interface MergeOperationResult {
+  success: boolean;
+  message: string;
+  commitSha?: string;
+  mergedFiles?: string[];
+  hadConflicts?: boolean;
+  conflicts?: MergeConflict[];
+}
+
+export interface MergePreviewResult {
+  success: boolean;
+  canMerge?: boolean;
+  sourceBranch?: string;
+  targetBranch?: string;
+  commitsAhead?: number;
+  filesChanged?: number;
+  additions?: number;
+  deletions?: number;
+  conflicts?: MergeConflict[];
+  changedFiles?: Array<{ path: string; additions: number; deletions: number; status: string }>;
+  error?: string;
+}
+
+export interface MergeStatusResult {
+  success: boolean;
+  branchExists?: boolean;
+  featureBranch?: string;
+  canMergeToDev?: boolean;
+  commitsAhead?: number;
+  filesChanged?: number;
+  additions?: number;
+  deletions?: number;
+  hasConflicts?: boolean;
+  error?: string;
+}
+
+export interface FeatureBranch {
+  name: string;
+  taskId: string;
+  isSubtask: boolean;
+}
+
+export const mergeApi = {
+  // Merge a subtask into its parent feature branch
+  mergeSubtask: async (taskId: string, subtaskId: string, options?: { noCommit?: boolean; message?: string }): Promise<MergeOperationResult> => {
+    return wsService.send<MergeOperationResult>('merge.subtask', { taskId, subtaskId, ...options });
+  },
+
+  // Merge a feature branch into dev
+  mergeFeatureToDev: async (taskId: string, options?: { noCommit?: boolean; message?: string }): Promise<MergeOperationResult> => {
+    return wsService.send<MergeOperationResult>('merge.featureToDev', { taskId, ...options });
+  },
+
+  // Preview a merge operation
+  preview: async (taskId: string, sourceBranch?: string, targetBranch?: string): Promise<MergePreviewResult> => {
+    return wsService.send<MergePreviewResult>('merge.preview', { taskId, sourceBranch, targetBranch });
+  },
+
+  // Get merge status for a task
+  status: async (taskId: string): Promise<MergeStatusResult> => {
+    return wsService.send<MergeStatusResult>('merge.status', { taskId });
+  },
+
+  // Ensure dev branch exists
+  ensureDevBranch: async (projectId: string, baseBranch?: string): Promise<{ success: boolean; message?: string; error?: string }> => {
+    return wsService.send('merge.ensureDevBranch', { projectId, baseBranch });
+  },
+
+  // Create a feature branch for a task
+  createFeatureBranch: async (taskId: string, baseBranch?: string): Promise<{ success: boolean; branchName?: string; message?: string; error?: string }> => {
+    return wsService.send('merge.createFeatureBranch', { taskId, baseBranch });
+  },
+
+  // List all feature branches for a project
+  listFeatureBranches: async (projectId: string): Promise<{ success: boolean; branches: FeatureBranch[]; hasDevBranch?: boolean; error?: string }> => {
+    return wsService.send('merge.listFeatureBranches', { projectId });
+  },
+};
+
+// ============================================================================
+// RELEASE API (Version Management)
+// ============================================================================
+
+export interface Release {
+  version: string;
+  branch: string;
+  status: 'candidate' | 'promoted' | 'abandoned';
+  tag?: string;
+  releaseNotes?: string;
+  tasks?: string[];
+  commit?: {
+    sha: string;
+    date: string;
+    message: string;
+  };
+}
+
+export interface VersionInfo {
+  current: string;
+  next: string;
+  bumpType: 'major' | 'minor' | 'patch';
+  breakingChanges: string[];
+  features: string[];
+  fixes: string[];
+}
+
+export const releaseApi = {
+  // List all releases for a project
+  list: async (projectId: string): Promise<{ success: boolean; releases: Release[]; error?: string }> => {
+    return wsService.send('release.list', { projectId });
+  },
+
+  // Get details of a specific release
+  get: async (projectId: string, version: string): Promise<{ success: boolean; release?: Release; error?: string }> => {
+    return wsService.send('release.get', { projectId, version });
+  },
+
+  // Create a new release candidate
+  create: async (projectId: string, version: string, options?: { releaseNotes?: string; taskIds?: string[] }): Promise<{ success: boolean; release?: Partial<Release>; message?: string; error?: string }> => {
+    return wsService.send('release.create', { projectId, version, ...options });
+  },
+
+  // Promote a release to main
+  promote: async (projectId: string, version: string, options?: { createTag?: boolean; backMerge?: boolean }): Promise<{ success: boolean; tag?: string; commitSha?: string; message?: string; error?: string }> => {
+    return wsService.send('release.promote', { projectId, version, ...options });
+  },
+
+  // Abandon a release
+  abandon: async (projectId: string, version: string, deleteBranch?: boolean): Promise<{ success: boolean; message?: string; error?: string }> => {
+    return wsService.send('release.abandon', { projectId, version, deleteBranch });
+  },
+
+  // Generate changelog for a release
+  generateChangelog: async (projectId: string, version: string, taskIds: string[]): Promise<{ success: boolean; changelog?: string; error?: string }> => {
+    return wsService.send('release.generateChangelog', { projectId, version, taskIds });
+  },
+
+  // Get current version
+  currentVersion: async (projectId: string): Promise<{ success: boolean; version?: string; error?: string }> => {
+    return wsService.send('version.current', { projectId });
+  },
+
+  // Calculate next version
+  nextVersion: async (projectId: string, taskIds?: string[]): Promise<{ success: boolean; error?: string } & Partial<VersionInfo>> => {
+    return wsService.send('version.next', { projectId, taskIds });
+  },
+};
+
+// ============================================================================
 // COMBINED API EXPORT
 // ============================================================================
 
@@ -349,6 +507,8 @@ export const api = {
   profiles: profilesApi,
   oauth: oauthApi,
   github: githubApi,
+  merge: mergeApi,
+  release: releaseApi,
 };
 
 export default api;

@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean, Integer, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean, Integer, JSON, ForeignKey, Table
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.pool import StaticPool
 
@@ -89,9 +89,16 @@ class TaskModel(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Additional fields
-    worktree_branch = Column(String, nullable=True)
+    worktree_branch = Column(String, nullable=True)  # Legacy - kept for migration
     archived = Column(Boolean, default=False)
     archived_version = Column(String, nullable=True)
+
+    # Hierarchical branching model fields
+    feature_branch = Column(String, nullable=True)  # e.g., "feature/task-abc123"
+    version_impact = Column(String, nullable=True)  # 'major', 'minor', 'patch'
+    is_breaking = Column(Boolean, default=False)
+    merged_to_dev_at = Column(DateTime, nullable=True)
+    release_version = Column(String, nullable=True)  # Version this task was released in
 
     # Extra data stored as JSON
     extra_data = Column(JSON, default=dict)
@@ -99,9 +106,10 @@ class TaskModel(Base):
     # Relationships
     project = relationship("ProjectModel", back_populates="tasks")
     spec = relationship("SpecModel", back_populates="task", uselist=False, cascade="all, delete-orphan")
+    subtasks = relationship("SubtaskModel", back_populates="task", cascade="all, delete-orphan")
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, include_subtasks: bool = False) -> dict:
+        result = {
             "id": self.id,
             "specId": self.spec_id,
             "projectId": self.project_id,
@@ -113,8 +121,17 @@ class TaskModel(Base):
             "worktreeBranch": self.worktree_branch,
             "archived": self.archived,
             "archivedVersion": self.archived_version,
+            # Hierarchical branching fields
+            "featureBranch": self.feature_branch,
+            "versionImpact": self.version_impact,
+            "isBreaking": self.is_breaking,
+            "mergedToDevAt": self.merged_to_dev_at.isoformat() if self.merged_to_dev_at else None,
+            "releaseVersion": self.release_version,
             "metadata": self.extra_data or {},
         }
+        if include_subtasks and self.subtasks:
+            result["subtasks"] = [s.to_dict() for s in self.subtasks]
+        return result
 
 
 class SpecModel(Base):
@@ -260,6 +277,87 @@ class TabStateModel(Base):
 
 
 # =============================================================================
+# Hierarchical Branching Model - New Tables
+# =============================================================================
+
+class SubtaskModel(Base):
+    """Subtask model for hierarchical task breakdown."""
+    __tablename__ = "subtasks"
+
+    id = Column(String, primary_key=True)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False)
+    title = Column(String(500), nullable=False)
+    description = Column(Text, nullable=True)
+    branch_name = Column(String(255), nullable=True)  # e.g., "feature/task-abc123/subtask-1"
+    status = Column(String(50), default="pending")  # pending, in_progress, completed, merged
+    order_index = Column(Integer, default=0)  # For ordering subtasks
+    merged_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    task = relationship("TaskModel", back_populates="subtasks")
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "taskId": self.task_id,
+            "title": self.title,
+            "description": self.description,
+            "branchName": self.branch_name,
+            "status": self.status,
+            "orderIndex": self.order_index,
+            "mergedAt": self.merged_at.isoformat() if self.merged_at else None,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# Junction table for releases and tasks (many-to-many)
+release_tasks = Table(
+    'release_tasks',
+    Base.metadata,
+    Column('release_id', String, ForeignKey('releases.id'), primary_key=True),
+    Column('task_id', String, ForeignKey('tasks.id'), primary_key=True)
+)
+
+
+class ReleaseModel(Base):
+    """Release model for version management."""
+    __tablename__ = "releases"
+
+    id = Column(String, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    version = Column(String(50), nullable=False)  # e.g., "1.2.0"
+    branch_name = Column(String(255), nullable=False)  # e.g., "release/1.2.0"
+    status = Column(String(50), default="candidate")  # candidate, released, abandoned
+    release_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    released_at = Column(DateTime, nullable=True)
+    created_by = Column(String(255), nullable=True)
+
+    # Relationships
+    project = relationship("ProjectModel")
+    tasks = relationship("TaskModel", secondary=release_tasks, backref="releases")
+
+    def to_dict(self, include_tasks: bool = False) -> dict:
+        result = {
+            "id": self.id,
+            "projectId": self.project_id,
+            "version": self.version,
+            "branchName": self.branch_name,
+            "status": self.status,
+            "releaseNotes": self.release_notes,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "releasedAt": self.released_at.isoformat() if self.released_at else None,
+            "createdBy": self.created_by,
+        }
+        if include_tasks:
+            result["tasks"] = [t.to_dict() for t in self.tasks]
+        return result
+
+
+# =============================================================================
 # Database Initialization
 # =============================================================================
 
@@ -280,9 +378,10 @@ def _run_migrations():
 
     with get_db_session() as db:
         inspector = inspect(engine)
+        table_names = inspector.get_table_names()
 
         # Check if projects table exists
-        if 'projects' in inspector.get_table_names():
+        if 'projects' in table_names:
             existing_columns = {col['name'] for col in inspector.get_columns('projects')}
 
             # Add new project columns if they don't exist
@@ -300,6 +399,27 @@ def _run_migrations():
                         print(f"[Database] Added column: projects.{col_name}")
                     except Exception as e:
                         print(f"[Database] Migration warning for {col_name}: {e}")
+
+        # Add new task columns for hierarchical branching model
+        if 'tasks' in table_names:
+            existing_columns = {col['name'] for col in inspector.get_columns('tasks')}
+
+            new_task_columns = [
+                ('feature_branch', 'VARCHAR(255)'),
+                ('version_impact', 'VARCHAR(20)'),
+                ('is_breaking', 'BOOLEAN DEFAULT FALSE'),
+                ('merged_to_dev_at', 'DATETIME'),
+                ('release_version', 'VARCHAR(50)'),
+            ]
+
+            for col_name, col_type in new_task_columns:
+                if col_name not in existing_columns:
+                    try:
+                        db.execute(text(f'ALTER TABLE tasks ADD COLUMN {col_name} {col_type}'))
+                        db.commit()
+                        print(f"[Database] Added column: tasks.{col_name}")
+                    except Exception as e:
+                        print(f"[Database] Migration warning for tasks.{col_name}: {e}")
 
 
 def get_db():
@@ -526,6 +646,17 @@ class TaskService:
                 task.archived_version = updates["archivedVersion"]
             if "metadata" in updates:
                 task.extra_data = {**(task.extra_data or {}), **updates["metadata"]}
+            # Hierarchical branching model fields
+            if "featureBranch" in updates:
+                task.feature_branch = updates["featureBranch"]
+            if "versionImpact" in updates:
+                task.version_impact = updates["versionImpact"]
+            if "isBreaking" in updates:
+                task.is_breaking = updates["isBreaking"]
+            if "mergedToDevAt" in updates:
+                task.merged_to_dev_at = updates["mergedToDevAt"]
+            if "releaseVersion" in updates:
+                task.release_version = updates["releaseVersion"]
 
             db.commit()
             db.refresh(task)
@@ -563,6 +694,256 @@ class TaskService:
             )
             db.commit()
             return count
+
+    @staticmethod
+    def get_merged_to_dev(project_id: str) -> List[dict]:
+        """Get all tasks that have been merged to dev but not released."""
+        with get_db_session() as db:
+            tasks = db.query(TaskModel).filter(
+                TaskModel.project_id == project_id,
+                TaskModel.merged_to_dev_at.isnot(None),
+                TaskModel.release_version.is_(None)
+            ).all()
+            return [t.to_dict() for t in tasks]
+
+
+# =============================================================================
+# Subtask Service
+# =============================================================================
+
+class SubtaskService:
+    """Service for subtask database operations."""
+
+    @staticmethod
+    def get_all(task_id: str) -> List[dict]:
+        """Get all subtasks for a task."""
+        with get_db_session() as db:
+            subtasks = db.query(SubtaskModel).filter(
+                SubtaskModel.task_id == task_id
+            ).order_by(SubtaskModel.order_index).all()
+            return [s.to_dict() for s in subtasks]
+
+    @staticmethod
+    def get_by_id(subtask_id: str) -> Optional[dict]:
+        """Get subtask by ID."""
+        with get_db_session() as db:
+            subtask = db.query(SubtaskModel).filter(SubtaskModel.id == subtask_id).first()
+            return subtask.to_dict() if subtask else None
+
+    @staticmethod
+    def create(subtask_data: dict) -> dict:
+        """Create a new subtask."""
+        with get_db_session() as db:
+            subtask = SubtaskModel(
+                id=subtask_data["id"],
+                task_id=subtask_data["taskId"],
+                title=subtask_data["title"],
+                description=subtask_data.get("description"),
+                branch_name=subtask_data.get("branchName"),
+                status=subtask_data.get("status", "pending"),
+                order_index=subtask_data.get("orderIndex", 0),
+            )
+            db.add(subtask)
+            db.commit()
+            db.refresh(subtask)
+            return subtask.to_dict()
+
+    @staticmethod
+    def update(subtask_id: str, updates: dict) -> Optional[dict]:
+        """Update a subtask."""
+        with get_db_session() as db:
+            subtask = db.query(SubtaskModel).filter(SubtaskModel.id == subtask_id).first()
+            if not subtask:
+                return None
+
+            if "title" in updates:
+                subtask.title = updates["title"]
+            if "description" in updates:
+                subtask.description = updates["description"]
+            if "branchName" in updates:
+                subtask.branch_name = updates["branchName"]
+            if "status" in updates:
+                subtask.status = updates["status"]
+            if "orderIndex" in updates:
+                subtask.order_index = updates["orderIndex"]
+            if "mergedAt" in updates:
+                subtask.merged_at = updates["mergedAt"]
+
+            db.commit()
+            db.refresh(subtask)
+            return subtask.to_dict()
+
+    @staticmethod
+    def delete(subtask_id: str) -> bool:
+        """Delete a subtask."""
+        with get_db_session() as db:
+            subtask = db.query(SubtaskModel).filter(SubtaskModel.id == subtask_id).first()
+            if not subtask:
+                return False
+            db.delete(subtask)
+            db.commit()
+            return True
+
+    @staticmethod
+    def mark_merged(subtask_id: str) -> Optional[dict]:
+        """Mark a subtask as merged."""
+        with get_db_session() as db:
+            subtask = db.query(SubtaskModel).filter(SubtaskModel.id == subtask_id).first()
+            if not subtask:
+                return None
+            subtask.status = "merged"
+            subtask.merged_at = datetime.utcnow()
+            db.commit()
+            db.refresh(subtask)
+            return subtask.to_dict()
+
+
+# =============================================================================
+# Release Service
+# =============================================================================
+
+class ReleaseService:
+    """Service for release database operations."""
+
+    @staticmethod
+    def get_all(project_id: str) -> List[dict]:
+        """Get all releases for a project."""
+        with get_db_session() as db:
+            releases = db.query(ReleaseModel).filter(
+                ReleaseModel.project_id == project_id
+            ).order_by(ReleaseModel.created_at.desc()).all()
+            return [r.to_dict() for r in releases]
+
+    @staticmethod
+    def get_by_id(release_id: str, include_tasks: bool = False) -> Optional[dict]:
+        """Get release by ID."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            return release.to_dict(include_tasks) if release else None
+
+    @staticmethod
+    def get_by_version(project_id: str, version: str, include_tasks: bool = False) -> Optional[dict]:
+        """Get release by version."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(
+                ReleaseModel.project_id == project_id,
+                ReleaseModel.version == version
+            ).first()
+            return release.to_dict(include_tasks) if release else None
+
+    @staticmethod
+    def get_latest(project_id: str) -> Optional[dict]:
+        """Get the latest released version for a project."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(
+                ReleaseModel.project_id == project_id,
+                ReleaseModel.status == "released"
+            ).order_by(ReleaseModel.released_at.desc()).first()
+            return release.to_dict() if release else None
+
+    @staticmethod
+    def create(release_data: dict) -> dict:
+        """Create a new release."""
+        with get_db_session() as db:
+            release = ReleaseModel(
+                id=release_data["id"],
+                project_id=release_data["projectId"],
+                version=release_data["version"],
+                branch_name=release_data["branchName"],
+                status=release_data.get("status", "candidate"),
+                release_notes=release_data.get("releaseNotes"),
+                created_by=release_data.get("createdBy"),
+            )
+            db.add(release)
+            db.commit()
+            db.refresh(release)
+            return release.to_dict()
+
+    @staticmethod
+    def update(release_id: str, updates: dict) -> Optional[dict]:
+        """Update a release."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            if not release:
+                return None
+
+            if "status" in updates:
+                release.status = updates["status"]
+            if "releaseNotes" in updates:
+                release.release_notes = updates["releaseNotes"]
+            if "releasedAt" in updates:
+                release.released_at = updates["releasedAt"]
+
+            db.commit()
+            db.refresh(release)
+            return release.to_dict()
+
+    @staticmethod
+    def add_task(release_id: str, task_id: str) -> bool:
+        """Add a task to a release."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+            if not release or not task:
+                return False
+            if task not in release.tasks:
+                release.tasks.append(task)
+                task.release_version = release.version
+                db.commit()
+            return True
+
+    @staticmethod
+    def remove_task(release_id: str, task_id: str) -> bool:
+        """Remove a task from a release."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+            if not release or not task:
+                return False
+            if task in release.tasks:
+                release.tasks.remove(task)
+                task.release_version = None
+                db.commit()
+            return True
+
+    @staticmethod
+    def mark_released(release_id: str) -> Optional[dict]:
+        """Mark a release as released."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            if not release:
+                return None
+            release.status = "released"
+            release.released_at = datetime.utcnow()
+            db.commit()
+            db.refresh(release)
+            return release.to_dict()
+
+    @staticmethod
+    def abandon(release_id: str) -> Optional[dict]:
+        """Mark a release as abandoned."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            if not release:
+                return None
+            release.status = "abandoned"
+            # Remove release version from associated tasks
+            for task in release.tasks:
+                task.release_version = None
+            db.commit()
+            db.refresh(release)
+            return release.to_dict()
+
+    @staticmethod
+    def delete(release_id: str) -> bool:
+        """Delete a release."""
+        with get_db_session() as db:
+            release = db.query(ReleaseModel).filter(ReleaseModel.id == release_id).first()
+            if not release:
+                return False
+            db.delete(release)
+            db.commit()
+            return True
 
 
 # =============================================================================

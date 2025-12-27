@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Play, Square, Clock, Zap, Target, Shield, Gauge, Palette, FileCode, Bug, Wrench, Loader2, AlertTriangle, RotateCcw, Archive } from 'lucide-react';
+import { Play, Square, Clock, Zap, Target, Shield, Gauge, Palette, FileCode, FileText, Bug, Wrench, Loader2, AlertTriangle, RotateCcw, Archive } from 'lucide-react';
 import { Card, CardContent } from './ui/card';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
@@ -17,7 +17,7 @@ import {
   EXECUTION_PHASE_LABELS,
   EXECUTION_PHASE_BADGE_COLORS
 } from '../../shared/constants';
-import { startTask, stopTask, checkTaskRunning, recoverStuckTask, isIncompleteHumanReview, archiveTasks } from '../stores/task-store';
+import { planTask, startTask, stopTask, checkTaskRunning, recoverStuckTask, isIncompleteHumanReview, archiveTasks } from '../stores/task-store';
 import type { Task, TaskCategory, ReviewReason } from '../../shared/types';
 
 // Category icon mapping
@@ -92,6 +92,11 @@ export function TaskCard({ task, onClick }: TaskCardProps) {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [task.id, isRunning]);
+
+  const handlePlan = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    planTask(task.id);
+  };
 
   const handleStartStop = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -374,7 +379,39 @@ export function TaskCard({ task, onClick }: TaskCardProps) {
               <Archive className="mr-1.5 h-3 w-3" />
               Archive
             </Button>
-          ) : (task.status === 'backlog' || task.status === 'in_progress') && (
+          ) : task.status === 'planning' ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-7 px-2.5"
+              disabled
+            >
+              <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
+              Planning...
+            </Button>
+          ) : task.status === 'backlog' ? (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5"
+                onClick={handlePlan}
+                title="Generate implementation plan before starting"
+              >
+                <FileText className="mr-1.5 h-3 w-3" />
+                Plan
+              </Button>
+              <Button
+                variant="default"
+                size="sm"
+                className="h-7 px-2.5"
+                onClick={handleStartStop}
+              >
+                <Play className="mr-1.5 h-3 w-3" />
+                Start
+              </Button>
+            </>
+          ) : task.status === 'in_progress' && (
             <Button
               variant={isRunning ? 'destructive' : 'default'}
               size="sm"

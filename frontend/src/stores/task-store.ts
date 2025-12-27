@@ -224,6 +224,23 @@ export async function createTask(
 }
 
 /**
+ * Start planning for a task (runs spec_runner in planning-only mode)
+ * Task moves to 'planning' status and generates spec/plan in background.
+ * When complete, task moves to 'human_review' with reason='plan_review'.
+ */
+export async function planTask(taskId: string): Promise<void> {
+  const store = useTaskStore.getState();
+  try {
+    const result = await tasksApi.plan(taskId);
+    console.log('[task-store] planTask result:', result);
+    // Update task status in store
+    store.updateTaskStatus(taskId, 'planning');
+  } catch (error) {
+    console.error('[task-store] planTask error:', error);
+  }
+}
+
+/**
  * Start a task
  */
 export async function startTask(taskId: string, _options?: { parallel?: boolean; workers?: number }): Promise<void> {

@@ -4,7 +4,7 @@
 
 import type { ThinkingLevel, PhaseModelConfig, PhaseThinkingConfig } from './settings';
 
-export type TaskStatus = 'backlog' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
+export type TaskStatus = 'backlog' | 'planning' | 'in_progress' | 'ai_review' | 'human_review' | 'done';
 
 // Reason why a task is in human_review status
 // - 'completed': All subtasks done and QA passed, ready for final approval/merge
@@ -228,6 +228,9 @@ export interface TaskMetadata {
   archivedInVersion?: string;  // Version in which task was archived (from changelog)
 }
 
+// Version impact for semantic versioning
+export type VersionImpact = 'major' | 'minor' | 'patch';
+
 export interface Task {
   id: string;
   specId: string;
@@ -244,6 +247,11 @@ export interface Task {
   releasedInVersion?: string;  // Version in which this task was released
   stagedInMainProject?: boolean;  // True if changes were staged to main project (worktree merged with --no-commit)
   stagedAt?: string;  // ISO timestamp when changes were staged
+  // Branching model fields
+  featureBranch?: string;  // Feature branch name (e.g., "feature/task-123")
+  versionImpact?: VersionImpact;  // SemVer impact when merged (major/minor/patch)
+  isBreaking?: boolean;  // Whether this is a breaking change
+  mergedToDevAt?: string;  // ISO timestamp when merged to dev branch
   createdAt: Date;
   updatedAt: Date;
 }
@@ -288,7 +296,9 @@ export interface PlanSubtask {
 // Workspace management types (for human review)
 export interface WorktreeStatus {
   exists: boolean;
-  worktreePath?: string;
+  worktreePath?: string;  // Legacy - use workspacePath
+  workspacePath?: string;  // Path to clone or worktree
+  workspaceType?: 'clone' | 'worktree';  // Type of workspace
   branch?: string;
   baseBranch?: string;
   commitCount?: number;

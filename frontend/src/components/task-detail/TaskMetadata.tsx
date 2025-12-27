@@ -10,7 +10,9 @@ import {
   Users,
   GitBranch,
   ListChecks,
-  Clock
+  Clock,
+  Tag,
+  AlertTriangle
 } from 'lucide-react';
 import { Badge } from '../ui/badge';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
@@ -120,6 +122,37 @@ export function TaskMetadata({ task }: TaskMetadataProps) {
                   : task.metadata.sourceType}
               </Badge>
             )}
+            {/* Version Impact */}
+            {task.versionImpact && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  'text-xs',
+                  task.versionImpact === 'major' ? 'border-destructive text-destructive' :
+                  task.versionImpact === 'minor' ? 'border-primary text-primary' :
+                  'border-muted-foreground text-muted-foreground'
+                )}
+              >
+                <Tag className="h-3 w-3 mr-1" />
+                {task.versionImpact}
+              </Badge>
+            )}
+            {/* Breaking Change */}
+            {task.isBreaking && (
+              <Badge variant="destructive" className="text-xs">
+                <AlertTriangle className="h-3 w-3 mr-1" />
+                Breaking
+              </Badge>
+            )}
+          </div>
+        )}
+        {/* Feature Branch */}
+        {task.featureBranch && (
+          <div className="flex items-center gap-1.5">
+            <Badge variant="outline" className="text-xs font-mono border-purple-400/50 text-purple-400">
+              <GitBranch className="h-3 w-3 mr-1" />
+              {task.featureBranch}
+            </Badge>
           </div>
         )}
 

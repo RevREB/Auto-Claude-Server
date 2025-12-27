@@ -1,15 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Settings, Download, RefreshCw, AlertCircle } from 'lucide-react';
+import { Settings } from 'lucide-react';
 import { TooltipProvider } from './components/ui/tooltip';
 import { Button } from './components/ui/button';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle
-} from './components/ui/dialog';
 import {
   Tooltip,
   TooltipContent,
@@ -28,7 +20,8 @@ import { Ideation } from './components/Ideation';
 import { Insights } from './components/Insights';
 import { GitHubIssues } from './components/GitHubIssues';
 import { Changelog } from './components/Changelog';
-import { Worktrees } from './components/Worktrees';
+import { MergeManager } from './components/MergeManager';
+import { ReleaseManager } from './components/ReleaseManager';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { RateLimitModal } from './components/RateLimitModal';
 import { SDKRateLimitModal } from './components/SDKRateLimitModal';
@@ -36,10 +29,9 @@ import { OnboardingWizard } from './components/onboarding';
 import { AppUpdateNotification } from './components/AppUpdateNotification';
 import { UsageIndicator } from './components/UsageIndicator';
 import { ProactiveSwapListener } from './components/ProactiveSwapListener';
-import { GitHubSetupModal } from './components/GitHubSetupModal';
 import { VersionCheck } from './components/VersionCheck';
 import { AddProjectModal } from './components/AddProjectModal';
-import { useProjectStore, loadProjects, addProject, initializeProject } from './stores/project-store';
+import { useProjectStore, loadProjects, addProject } from './stores/project-store';
 import { useTaskStore, loadTasks, reconcileTasks, setActiveProjectForTasks } from './stores/task-store';
 import { wsService } from './lib/websocket-service';
 import { useSettingsStore, loadSettings } from './stores/settings-store';
@@ -72,17 +64,6 @@ export function App() {
   const [isOnboardingWizardOpen, setIsOnboardingWizardOpen] = useState(false);
   const [isAddProjectModalOpen, setIsAddProjectModalOpen] = useState(false);
 
-  // Initialize dialog state
-  const [showInitDialog, setShowInitDialog] = useState(false);
-  const [pendingProject, setPendingProject] = useState<Project | null>(null);
-  const [isInitializing, setIsInitializing] = useState(false);
-  const [initSuccess, setInitSuccess] = useState(false);
-  const [initError, setInitError] = useState<string | null>(null);
-  const [skippedInitProjectId, setSkippedInitProjectId] = useState<string | null>(null);
-
-  // GitHub setup state (shown after Auto Claude init)
-  const [showGitHubSetup, setShowGitHubSetup] = useState(false);
-  const [gitHubSetupProject, setGitHubSetupProject] = useState<Project | null>(null);
 
   // Get selected project
   const selectedProject = projects.find((p) => p.id === (activeProjectId || selectedProjectId));
@@ -183,31 +164,6 @@ export function App() {
     };
   }, []);
 
-  // Reset init success flag when selected project changes
-  // This allows the init dialog to show for new/different projects
-  useEffect(() => {
-    setInitSuccess(false);
-    setInitError(null);
-  }, [selectedProjectId]);
-
-  // Check if selected project needs initialization (e.g., .auto-claude folder was deleted)
-  useEffect(() => {
-    // Don't show dialog while initialization is in progress
-    if (isInitializing) return;
-
-    // Don't reopen dialog after successful initialization
-    // (project update with autoBuildPath may not have propagated yet)
-    if (initSuccess) return;
-
-    if (selectedProject && !selectedProject.autoBuildPath && skippedInitProjectId !== selectedProject.id) {
-      // Project exists but isn't initialized - show init dialog
-      setPendingProject(selectedProject);
-      setInitError(null); // Clear any previous errors
-      setInitSuccess(false); // Reset success flag
-      setShowInitDialog(true);
-    }
-  }, [selectedProject, skippedInitProjectId, isInitializing, initSuccess]);
-
   // Global keyboard shortcut: Cmd/Ctrl+T to add project (when not on terminals view)
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
@@ -229,12 +185,6 @@ export function App() {
             const project = await addProject(path);
             if (project) {
               openProjectTab(project.id);
-              if (!project.autoBuildPath) {
-                setPendingProject(project);
-                setInitError(null);
-                setInitSuccess(false);
-                setShowInitDialog(true);
-              }
             }
           }
         } catch (error) {
@@ -371,116 +321,9 @@ export function App() {
     }
   };
 
-  const handleProjectAdded = (project: Project, needsInit: boolean) => {
+  const handleProjectAdded = (project: Project) => {
     // Open a tab for the new project
     openProjectTab(project.id);
-
-    if (needsInit) {
-      // Project doesn't have Auto Claude initialized, show init dialog
-      setPendingProject(project);
-      setInitError(null);
-      setInitSuccess(false);
-      setShowInitDialog(true);
-    }
-  };
-
-  const handleInitialize = async () => {
-    if (!pendingProject) return;
-
-    const projectId = pendingProject.id;
-    console.log('[InitDialog] Starting initialization for project:', projectId);
-    setIsInitializing(true);
-    setInitSuccess(false);
-    setInitError(null); // Clear any previous errors
-    try {
-      const result = await initializeProject(projectId);
-      console.log('[InitDialog] Initialization result:', result);
-
-      if (result?.success) {
-        console.log('[InitDialog] Initialization successful, closing dialog');
-        // Get the updated project from store
-        const updatedProject = useProjectStore.getState().projects.find(p => p.id === projectId);
-        console.log('[InitDialog] Updated project:', updatedProject);
-
-        // Mark as successful to prevent onOpenChange from treating this as a skip
-        setInitSuccess(true);
-        setIsInitializing(false);
-
-        // Now close the dialog
-        setShowInitDialog(false);
-        setPendingProject(null);
-
-        // Show GitHub setup modal
-        if (updatedProject) {
-          setGitHubSetupProject(updatedProject);
-          setShowGitHubSetup(true);
-        }
-      } else {
-        // Initialization failed - show error but keep dialog open
-        console.log('[InitDialog] Initialization failed, showing error');
-        const errorMessage = result?.error || 'Failed to initialize Auto Claude. Please try again.';
-        setInitError(errorMessage);
-        setIsInitializing(false);
-      }
-    } catch (error) {
-      // Unexpected error occurred
-      console.error('[InitDialog] Unexpected error during initialization:', error);
-      const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred';
-      setInitError(errorMessage);
-      setIsInitializing(false);
-    }
-  };
-
-  const handleGitHubSetupComplete = async (settings: {
-    githubToken: string;
-    githubRepo: string;
-    mainBranch: string;
-  }) => {
-    if (!gitHubSetupProject) return;
-
-    try {
-      // NOTE: settings.githubToken is a GitHub access token (from gh CLI),
-      // NOT a Claude Code OAuth token. They are different things:
-      // - GitHub token: for GitHub API access (repo operations)
-      // - Claude token: for Claude AI access (run.py, roadmap, etc.)
-      // The user needs to separately authenticate with Claude using 'claude setup-token'
-
-      // Update project env config with GitHub settings
-      await window.api.updateProjectEnv(gitHubSetupProject.id, {
-        githubEnabled: true,
-        githubToken: settings.githubToken, // GitHub token for repo access
-        githubRepo: settings.githubRepo
-      });
-
-      // Update project settings with mainBranch
-      await window.api.updateProjectSettings(gitHubSetupProject.id, {
-        mainBranch: settings.mainBranch
-      });
-
-      // Refresh projects to get updated data
-      await loadProjects();
-    } catch (error) {
-      console.error('Failed to save GitHub settings:', error);
-    }
-
-    setShowGitHubSetup(false);
-    setGitHubSetupProject(null);
-  };
-
-  const handleGitHubSetupSkip = () => {
-    setShowGitHubSetup(false);
-    setGitHubSetupProject(null);
-  };
-
-  const handleSkipInit = () => {
-    console.log('[InitDialog] User skipped initialization');
-    if (pendingProject) {
-      setSkippedInitProjectId(pendingProject.id);
-    }
-    setShowInitDialog(false);
-    setPendingProject(null);
-    setInitError(null); // Clear any error when skipping
-    setInitSuccess(false); // Reset success flag
   };
 
   const handleGoToTask = (taskId: string) => {
@@ -577,8 +420,11 @@ export function App() {
                 {activeView === 'changelog' && (activeProjectId || selectedProjectId) && (
                   <Changelog />
                 )}
-                {activeView === 'worktrees' && (activeProjectId || selectedProjectId) && (
-                  <Worktrees projectId={activeProjectId || selectedProjectId!} />
+                {activeView === 'merges' && (activeProjectId || selectedProjectId) && (
+                  <MergeManager />
+                )}
+                {activeView === 'releases' && (activeProjectId || selectedProjectId) && (
+                  <ReleaseManager />
                 )}
                 {activeView === 'agent-tools' && (
                   <div className="flex h-full items-center justify-center">
@@ -641,96 +487,6 @@ export function App() {
             setIsOnboardingWizardOpen(true);
           }}
         />
-
-        {/* Initialize Auto Claude Dialog */}
-        <Dialog open={showInitDialog} onOpenChange={(open) => {
-          console.log('[InitDialog] onOpenChange called', { open, pendingProject: !!pendingProject, isInitializing, initSuccess });
-          // Only trigger skip if user manually closed the dialog
-          // Don't trigger if: successful init, no pending project, or currently initializing
-          if (!open && pendingProject && !isInitializing && !initSuccess) {
-            handleSkipInit();
-          }
-        }}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
-                <Download className="h-5 w-5" />
-                Initialize Auto Claude
-              </DialogTitle>
-              <DialogDescription>
-                This project doesn't have Auto Claude initialized. Would you like to set it up now?
-              </DialogDescription>
-            </DialogHeader>
-            <div className="py-4">
-              <div className="rounded-lg bg-muted p-4 text-sm">
-                <p className="font-medium mb-2">This will:</p>
-                <ul className="list-disc list-inside space-y-1 text-muted-foreground">
-                  <li>Create a <code className="text-xs bg-background px-1 py-0.5 rounded">.auto-claude</code> folder in your project</li>
-                  <li>Copy the Auto Claude framework files</li>
-                  <li>Set up the specs directory for your tasks</li>
-                </ul>
-              </div>
-              {!settings.autoBuildPath && (
-                <div className="mt-4 rounded-lg border border-warning/50 bg-warning/10 p-4 text-sm">
-                  <div className="flex items-start gap-2">
-                    <AlertCircle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
-                    <div>
-                      <p className="font-medium text-warning">Source path not configured</p>
-                      <p className="text-muted-foreground mt-1">
-                        Please set the Auto Claude source path in App Settings before initializing.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
-              {initError && (
-                <div className="mt-4 rounded-lg border border-destructive/50 bg-destructive/10 p-4 text-sm">
-                  <div className="flex items-start gap-2">
-                    <AlertCircle className="h-4 w-4 text-destructive mt-0.5 shrink-0" />
-                    <div>
-                      <p className="font-medium text-destructive">Initialization Failed</p>
-                      <p className="text-muted-foreground mt-1">
-                        {initError}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={handleSkipInit} disabled={isInitializing}>
-                Skip
-              </Button>
-              <Button
-                onClick={handleInitialize}
-                disabled={isInitializing || !settings.autoBuildPath}
-              >
-                {isInitializing ? (
-                  <>
-                    <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                    Initializing...
-                  </>
-                ) : (
-                  <>
-                    <Download className="mr-2 h-4 w-4" />
-                    Initialize
-                  </>
-                )}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        {/* GitHub Setup Modal - shows after Auto Claude init to configure GitHub */}
-        {gitHubSetupProject && (
-          <GitHubSetupModal
-            open={showGitHubSetup}
-            onOpenChange={setShowGitHubSetup}
-            project={gitHubSetupProject}
-            onComplete={handleGitHubSetupComplete}
-            onSkip={handleGitHubSetupSkip}
-          />
-        )}
 
         {/* Add Project Modal - for creating new projects or cloning repos */}
         <AddProjectModal

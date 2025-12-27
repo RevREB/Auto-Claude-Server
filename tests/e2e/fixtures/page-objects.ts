@@ -49,7 +49,7 @@ export class SidebarPage extends BasePage {
     return this.page.locator('[data-testid="sidebar"]').or(this.page.locator('nav').first());
   }
 
-  async navigateTo(view: 'kanban' | 'terminals' | 'roadmap' | 'ideation' | 'context' | 'insights' | 'changelog' | 'github-issues' | 'worktrees') {
+  async navigateTo(view: 'kanban' | 'terminals' | 'roadmap' | 'ideation' | 'context' | 'insights' | 'changelog' | 'github-issues' | 'worktrees' | 'merges' | 'releases') {
     const viewLabels: Record<string, string> = {
       'kanban': 'Kanban',
       'terminals': 'Terminals',
@@ -59,7 +59,9 @@ export class SidebarPage extends BasePage {
       'insights': 'Insights',
       'changelog': 'Changelog',
       'github-issues': 'GitHub Issues',
-      'worktrees': 'Worktrees'
+      'worktrees': 'Worktrees',
+      'merges': 'Merges',
+      'releases': 'Releases'
     };
 
     const link = this.page.getByText(viewLabels[view], { exact: true });

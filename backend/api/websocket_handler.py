@@ -279,6 +279,29 @@ def register_handlers(app_state: dict):
 
         return result.get("data", result)
 
+    async def tasks_plan(conn_id: str, payload: dict) -> dict:
+        """Start planning for a task (runs spec_runner in planning-only mode)."""
+        task_id = payload.get("taskId")
+        result = await api_main.plan_task(task_id)
+        # Auto-subscribe to task events
+        ws_manager.subscribe(conn_id, f"task.{task_id}")
+
+        # Broadcast task status change to planning
+        if task_id in api_main.tasks:
+            task = api_main.tasks[task_id]
+            await ws_manager.broadcast_event(f"project.{task.project_id}.tasks", {
+                "action": "updated",
+                "task": {
+                    "id": task_id,
+                    "specId": task.spec_id,
+                    "projectId": task.project_id,
+                    "status": task.status,
+                    "title": task.title
+                }
+            })
+
+        return result.get("data", result)
+
     async def tasks_stop(conn_id: str, payload: dict) -> dict:
         """Stop a task."""
         task_id = payload.get("taskId")
@@ -1170,7 +1193,7 @@ def register_handlers(app_state: dict):
     # =========================================================================
 
     async def workspace_get_status(conn_id: str, payload: dict) -> dict:
-        """Get worktree status for a task."""
+        """Get workspace status for a task (supports both clones and legacy worktrees)."""
         task_id = payload.get("taskId")
         if not task_id:
             raise ValueError("taskId required")
@@ -1187,38 +1210,51 @@ def register_handlers(app_state: dict):
 
         project = api_main.projects[project_id]
         project_path = Path(project.path)
-        worktree_path = project_path / ".worktrees" / task_id
 
-        if not worktree_path.exists():
+        # Check for clone first (new model), then fall back to worktree (legacy)
+        workspace_path = None
+        workspace_type = None
+
+        # Try CloneManager first
+        try:
+            from core.clone_manager import get_clone_manager
+            clone_mgr = get_clone_manager(project_path)
+            clone_path = clone_mgr.get_clone_path(task_id)
+            if clone_path and clone_path.exists():
+                workspace_path = clone_path
+                workspace_type = "clone"
+        except (ImportError, Exception) as e:
+            print(f"[Workspace] Clone check failed: {e}")
+
+        # Fall back to legacy worktree
+        if not workspace_path:
+            worktree_path = project_path / ".worktrees" / task_id
+            if worktree_path.exists():
+                workspace_path = worktree_path
+                workspace_type = "worktree"
+
+        if not workspace_path:
             return {"exists": False}
 
-        # Get git info from the worktree
+        # Get git info from the workspace
         import subprocess
 
         try:
             # Get branch name
             branch_result = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=str(worktree_path),
+                cwd=str(workspace_path),
                 capture_output=True,
                 text=True
             )
             branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
 
-            # Get diff stats
-            diff_result = subprocess.run(
-                ["git", "diff", "--stat", "HEAD~1..HEAD"],
-                cwd=str(worktree_path),
-                capture_output=True,
-                text=True
-            )
-
-            # Detect base branch (main or master)
+            # Detect base branch (dev, main, or master)
             base_branch = "main"
-            for try_branch in ["main", "master"]:
+            for try_branch in ["dev", "main", "master"]:
                 check = subprocess.run(
-                    ["git", "rev-parse", "--verify", try_branch],
-                    cwd=str(worktree_path),
+                    ["git", "rev-parse", "--verify", f"origin/{try_branch}"],
+                    cwd=str(workspace_path),
                     capture_output=True,
                     text=True
                 )
@@ -1228,8 +1264,8 @@ def register_handlers(app_state: dict):
 
             # Count commits ahead of base branch
             commit_result = subprocess.run(
-                ["git", "rev-list", "--count", f"{base_branch}..HEAD"],
-                cwd=str(worktree_path),
+                ["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"],
+                cwd=str(workspace_path),
                 capture_output=True,
                 text=True
             )
@@ -1237,8 +1273,8 @@ def register_handlers(app_state: dict):
 
             # Get file change counts
             shortstat = subprocess.run(
-                ["git", "diff", "--shortstat", f"{base_branch}..HEAD"],
-                cwd=str(worktree_path),
+                ["git", "diff", "--shortstat", f"origin/{base_branch}..HEAD"],
+                cwd=str(workspace_path),
                 capture_output=True,
                 text=True
             )
@@ -1265,18 +1301,20 @@ def register_handlers(app_state: dict):
                 "exists": True,
                 "branch": branch,
                 "baseBranch": base_branch,
-                "worktreePath": str(worktree_path),
+                "workspacePath": str(workspace_path),
+                "worktreePath": str(workspace_path),  # Legacy compatibility
+                "workspaceType": workspace_type,
                 "commitCount": commit_count,
                 "filesChanged": files_changed,
                 "additions": additions,
                 "deletions": deletions
             }
         except Exception as e:
-            print(f"[Workspace] Error getting worktree status: {e}")
+            print(f"[Workspace] Error getting workspace status: {e}")
             return {"exists": True, "branch": "unknown", "error": str(e)}
 
     async def workspace_get_diff(conn_id: str, payload: dict) -> dict:
-        """Get file diff for a worktree."""
+        """Get file diff for a workspace (clone or worktree)."""
         task_id = payload.get("taskId")
         if not task_id or task_id not in api_main.tasks:
             return {"files": [], "summary": "Task not found"}
@@ -1286,18 +1324,35 @@ def register_handlers(app_state: dict):
         if not project:
             return {"files": [], "summary": "Project not found"}
 
-        worktree_path = Path(project.path) / ".worktrees" / task_id
-        if not worktree_path.exists():
-            return {"files": [], "summary": "Worktree not found"}
+        project_path = Path(project.path)
+
+        # Check for clone first, then worktree
+        workspace_path = None
+        try:
+            from core.clone_manager import get_clone_manager
+            clone_mgr = get_clone_manager(project_path)
+            clone_path = clone_mgr.get_clone_path(task_id)
+            if clone_path and clone_path.exists():
+                workspace_path = clone_path
+        except (ImportError, Exception):
+            pass
+
+        if not workspace_path:
+            worktree_path = project_path / ".worktrees" / task_id
+            if worktree_path.exists():
+                workspace_path = worktree_path
+
+        if not workspace_path:
+            return {"files": [], "summary": "Workspace not found"}
 
         import subprocess
         try:
             # Detect base branch
             base_branch = "main"
-            for try_branch in ["main", "master"]:
+            for try_branch in ["dev", "main", "master"]:
                 check = subprocess.run(
-                    ["git", "rev-parse", "--verify", try_branch],
-                    cwd=str(worktree_path),
+                    ["git", "rev-parse", "--verify", f"origin/{try_branch}"],
+                    cwd=str(workspace_path),
                     capture_output=True,
                     text=True
                 )
@@ -1306,8 +1361,8 @@ def register_handlers(app_state: dict):
                     break
 
             result = subprocess.run(
-                ["git", "diff", "--numstat", f"{base_branch}..HEAD"],
-                cwd=str(worktree_path),
+                ["git", "diff", "--numstat", f"origin/{base_branch}..HEAD"],
+                cwd=str(workspace_path),
                 capture_output=True,
                 text=True
             )
@@ -1436,10 +1491,26 @@ def register_handlers(app_state: dict):
         if not project:
             return {"success": False, "message": "Project not found"}
 
-        # For now, return a simple preview
-        worktree_path = Path(project.path) / ".worktrees" / task_id
-        if not worktree_path.exists():
-            return {"success": False, "message": "Worktree not found"}
+        project_path = Path(project.path)
+
+        # Check for clone first, then worktree
+        workspace_path = None
+        try:
+            from core.clone_manager import get_clone_manager
+            clone_mgr = get_clone_manager(project_path)
+            clone_path = clone_mgr.get_clone_path(task_id)
+            if clone_path and clone_path.exists():
+                workspace_path = clone_path
+        except (ImportError, Exception):
+            pass
+
+        if not workspace_path:
+            worktree_path = project_path / ".worktrees" / task_id
+            if worktree_path.exists():
+                workspace_path = worktree_path
+
+        if not workspace_path:
+            return {"success": False, "message": "Workspace not found"}
 
         return {
             "success": True,
@@ -1457,7 +1528,7 @@ def register_handlers(app_state: dict):
         }
 
     async def workspace_discard(conn_id: str, payload: dict) -> dict:
-        """Discard worktree changes."""
+        """Discard workspace (clone or worktree) changes."""
         task_id = payload.get("taskId")
         if not task_id or task_id not in api_main.tasks:
             raise ValueError("Task not found")
@@ -1467,36 +1538,76 @@ def register_handlers(app_state: dict):
         if not project:
             raise ValueError("Project not found")
 
-        worktree_path = Path(project.path) / ".worktrees" / task_id
+        project_path = Path(project.path)
+        cleaned = False
+
+        # Try to clean up clone first
+        try:
+            from core.clone_manager import get_clone_manager
+            clone_mgr = get_clone_manager(project_path)
+            if clone_mgr.cleanup_clone(task_id):
+                cleaned = True
+                print(f"[Workspace] Cleaned up clone for task {task_id}")
+        except (ImportError, Exception) as e:
+            print(f"[Workspace] Clone cleanup failed: {e}")
+
+        # Also clean up legacy worktree if exists
+        worktree_path = project_path / ".worktrees" / task_id
         if worktree_path.exists():
             import shutil
             shutil.rmtree(worktree_path)
+            cleaned = True
+            print(f"[Workspace] Cleaned up worktree for task {task_id}")
 
         # Update task status back to backlog
         task.status = "backlog"
         api_main._save_tasks()
 
-        return {"success": True, "message": "Worktree discarded"}
+        return {"success": True, "message": "Workspace discarded" if cleaned else "No workspace found"}
 
     async def workspace_list(conn_id: str, payload: dict) -> dict:
-        """List all worktrees for a project."""
+        """List all workspaces (clones and worktrees) for a project."""
         project_id = payload.get("projectId")
         if not project_id or project_id not in api_main.projects:
-            return {"worktrees": []}
+            return {"worktrees": [], "workspaces": []}
 
         project = api_main.projects[project_id]
-        worktrees_dir = Path(project.path) / ".worktrees"
+        project_path = Path(project.path)
 
-        worktrees = []
+        workspaces = []
+
+        # List clones
+        try:
+            from core.clone_manager import get_clone_manager
+            clone_mgr = get_clone_manager(project_path)
+            for clone_info in clone_mgr.list_active_clones():
+                workspaces.append({
+                    "id": clone_info.task_id,
+                    "path": str(clone_info.clone_path),
+                    "type": "clone",
+                    "branch": clone_info.branch
+                })
+        except (ImportError, Exception) as e:
+            print(f"[Workspace] Clone listing failed: {e}")
+
+        # List legacy worktrees
+        worktrees_dir = project_path / ".worktrees"
         if worktrees_dir.exists():
             for wt in worktrees_dir.iterdir():
                 if wt.is_dir() and not wt.name.startswith("."):
-                    worktrees.append({
-                        "id": wt.name,
-                        "path": str(wt)
-                    })
+                    # Check if already in workspaces (avoid duplicates)
+                    if not any(w["id"] == wt.name for w in workspaces):
+                        workspaces.append({
+                            "id": wt.name,
+                            "path": str(wt),
+                            "type": "worktree"
+                        })
 
-        return {"worktrees": worktrees}
+        # Legacy compatibility: also return as worktrees
+        return {
+            "worktrees": workspaces,
+            "workspaces": workspaces
+        }
 
     # Register all handlers
     handlers = {
@@ -1505,6 +1616,7 @@ def register_handlers(app_state: dict):
         "tasks.create": tasks_create,
         "tasks.update": tasks_update,
         "tasks.delete": tasks_delete,
+        "tasks.plan": tasks_plan,
         "tasks.start": tasks_start,
         "tasks.stop": tasks_stop,
         "tasks.getLogs": tasks_get_logs,
@@ -1595,6 +1707,8 @@ def register_handlers(app_state: dict):
     from .ideation_handler import register_ideation_handlers
     from .github_integration_handler import register_github_integration_handlers
     from .branch_model_handler import register_branch_model_handlers
+    from .merge_handler import register_merge_handlers
+    from .release_handler import register_release_handlers
 
     register_insights_handlers(ws_manager, api_main)
     register_changelog_handlers(ws_manager, api_main)
@@ -1603,3 +1717,5 @@ def register_handlers(app_state: dict):
     register_ideation_handlers(ws_manager, api_main)
     register_github_integration_handlers(ws_manager, api_main)
     register_branch_model_handlers(ws_manager, api_main)
+    register_merge_handlers(ws_manager, api_main)
+    register_release_handlers(ws_manager, api_main)
